@@ -67,7 +67,10 @@ python3 "$repo_root/scripts/apply-board-patches.py" "$xnu_path" \
   "$repo_root/patches/0057-b2l-scoped-coregraphics-backtrace.patch" \
   "$repo_root/patches/0058-b2l-owned-launch-cache.patch" \
   "$repo_root/patches/0059-b2l-typed-critical-exit.patch" \
-  "$repo_root/patches/0060-b2l-max77705-battery.patch"
+  "$repo_root/patches/0060-b2l-max77705-battery.patch" \
+  "$repo_root/patches/0061-b2l-mali-g76-selftest.patch" \
+  "$repo_root/patches/0062-b2l-gpu-ui-exec.patch" \
+  "$repo_root/patches/0063-b2l-power.patch"
 # New files have separate provenance and are kept as an overlay.
 while IFS= read -r -d '' source_file; do
   relative="${source_file#"$repo_root/xnu-overlay/"}"

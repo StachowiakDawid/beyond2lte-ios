@@ -68,7 +68,7 @@ static void IOLockSleep(void*,void*,int){assert(locks==1);++sleeps;--locks;run_w
 static void IOLockWakeup(void*,void*,bool){++wakeups;}
 class AppleCLCD {
  public:
- uintptr_t fPixels;uint32_t fWidth=4,fHeight=3,fRowBytes=20;
+ uintptr_t fPixels;uintptr_t fPanelPixels=0;uint32_t fTopInset=0;uint32_t fWidth=4,fHeight=3,fRowBytes=20;
  B2LSurface *fSurface=nullptr;void *fLock=nullptr;bool fConsolePaused=false;
  uint32_t fPerfSwaps=0,fPerfCopies=0,fPerfFull=0,fPerfReports=0,fPerfWaits=0,fCopyLogs=0;
  uint64_t fPerfPixels=0,fPerfTicks=0,fPerfMaxTicks=0,fPerfWritten=0,fPerfWaitTicks=0;

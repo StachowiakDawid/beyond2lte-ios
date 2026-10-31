@@ -13,15 +13,26 @@ class B2LPlatformExpert : public IODTPlatformExpert {
 	OSDeclareDefaultStructors(B2LPlatformExpert);
 public:
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(B2LPlatformExpert, IODTPlatformExpert);
 
+extern "C" void b2l_power_init(void);
+extern "C" bool b2l_power_halt_restart(unsigned int type);
+
+int
+B2LPlatformExpert::haltRestart(unsigned int type)
+{
+	return b2l_power_halt_restart(type) ? 0 : IODTPlatformExpert::haltRestart(type);
+}
+
 bool
 B2LPlatformExpert::start(IOService *provider)
 {
+	b2l_power_init();
 	IOLog("B2L: starting device-tree platform expert\n");
 	if (!IODTPlatformExpert::start(provider)) {
 		return false;

@@ -7,6 +7,7 @@
 #include <kern/sched_prim.h>
 #include <kern/clock.h>
 #include <mach/mach_time.h>
+#include "b2l_cpu_clock.h"
 static struct b2l_log_ring console_ring;
 static struct b2l_log_writer disk_writer;
 static uint32_t start_state;
@@ -17,12 +18,15 @@ void b2l_log_append_bytes(const void*p,size_t n){b2l_log_ring_append_bytes(&cons
 static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
 {
     unsigned reports=0,ticks=0;
+    bool clocks_reported=false;
     for(;;){
         /* For the first 300 s, drain every second and leave a TICK line, so
          * the last line on disk dates a stall to within about one second. */
         uint64_t up=0;absolutetime_to_nanoseconds(mach_absolute_time(),&up);up/=NSEC_PER_SEC;
         bool early=up<300;
         if(early)b2l_early_trace("B2L TICK sec=%llu\n",up);
+        /* Once, after SMP bring-up and before the UI loads the CPUs. */
+        if(!clocks_reported&&up>=20){clocks_reported=true;b2l_cpu_clock_report();}
         int err=b2l_log_writer_drain(&disk_writer,&console_ring,128);
         if(err){__atomic_fetch_add(&flush_failures,1,__ATOMIC_RELAXED);__atomic_store_n(&last_error,err,__ATOMIC_RELAXED);}
         /* Outside every storage lock/callback. One bounded progress line per

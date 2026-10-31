@@ -200,6 +200,12 @@ b2l_surface_copy(uint32_t id)
 	return s;
 }
 
+uint32_t
+b2l_surface_current_seed(B2LSurface *s)
+{
+	return *b2l_surface_seed(s);
+}
+
 /* The table lock; the framebuffer may publish a surface before the root starts. */
 static void
 b2l_surface_init_lock(void)

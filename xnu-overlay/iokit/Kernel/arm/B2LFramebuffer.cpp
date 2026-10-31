@@ -20,6 +20,7 @@
  */
 #include "B2LSurface.h"
 #include "B2LBlit.h"
+extern "C" void b2l_hid_set_display_inset(uint32_t inset_rows, uint32_t panel_rows);
 
 #if defined(B2L)
 #include <IOKit/IOService.h>
@@ -59,6 +60,10 @@ enum {
 #define B2L_FB_VSYNC_US               16667
 #define B2L_FB_DOT_PITCH              522     /* S10+ panel; geometry still comes from GOP */
 #define B2L_FB_FORMAT_BGRA            0x42475241
+/* Rows kept black above iOS for the S10+ front-camera hole (top right). 136
+ * leaves 1440x2904, exactly 480x968 points at 3x, and keeps every row start
+ * 64-byte aligned. Boot argument b2l_fb_top_inset overrides it. */
+#define B2L_FB_TOP_INSET              136
 
 class IOMobileFramebuffer : public IOService {
 	OSDeclareDefaultStructors(IOMobileFramebuffer);
@@ -90,7 +95,9 @@ class AppleCLCD : public IOMobileFramebuffer {
 public:
 	uint64_t      fPhys;
 	uint32_t      fWidth, fHeight, fRowBytes;
-	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+	uintptr_t     fPixels;          /* kernel mapping of the presented area */
+	uintptr_t     fPanelPixels;     /* kernel mapping of the whole panel */
+	uint32_t      fTopInset;        /* black rows above the presented area */
 	IOMemoryMap  *fMap;
 	B2LSurface *fSurface;         /* the panel memory as an IOSurface */
 	IOLock       *fLock;            /* swaps and client list */
@@ -165,14 +172,25 @@ AppleCLCD::start(IOService *provider)
 	fLock = IOLockAlloc();
 	fClients = OSArray::withCapacity(4);
 	fSurface = b2l_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, B2L_FB_FORMAT_BGRA);
-	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+	fPanelPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
 	fWorkLoop = IOWorkLoop::workLoop();
-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+	if (fLock == NULL || fClients == NULL || fPanelPixels == 0 || fWorkLoop == NULL) {
 		IOLog("B2L FB: setup failed\n");
 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
 		OSSafeReleaseNULL(fWorkLoop);
 		return false;
 	}
+	/* From here on fPixels/fHeight describe only the area below the camera
+	 * band: GetDisplaySize, copies, clipping and the shadow all use it. The
+	 * default surface stays the whole physical panel and is never copied. */
+	uint32_t inset = B2L_FB_TOP_INSET;
+	PE_parse_boot_argn("b2l_fb_top_inset", &inset, sizeof(inset));
+	if (inset > fHeight / 4) inset = 0;
+	fTopInset = inset;
+	fPixels = fPanelPixels + (uintptr_t)fRowBytes * inset;
+	fHeight -= inset;
+	b2l_hid_set_display_inset(inset, fHeight + inset);
+	IOLog("B2L FB: top inset %u rows, presenting %ux%u\n", inset, fWidth, fHeight);
 	/* Without a shadow every copy is a full write; without the thread call it
 	 * runs in SwapEnd as before. Both are allowed to fail. */
 	/* Dirty-span copy (64-byte aligned spans, see B2LBlit.h); boot argument
@@ -400,6 +418,12 @@ AppleCLCD::runCopy(void)
 	if (job.count && !fConsolePaused) {
 		b2l_early_gui_present();
 		fConsolePaused = true;
+		/* Clear boot-console text from the camera band once; whole rows,
+		 * so every write is 64-byte aligned like all other panel writes. */
+		for (uint32_t y = 0; y < fTopInset; y++) {
+			volatile uint64_t *row = (volatile uint64_t *)(fPanelPixels + (uintptr_t)y * fRowBytes);
+			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = 0xff000000ff000000ull;
+		}
 		IOLog("B2L FB: first IOSurface frame copied to physical scanout\n");
 	}
 	uint64_t start = mach_absolute_time(), written = 0, pixels = 0;

@@ -77,6 +77,23 @@ static int b2l_apps_publish(const char *final,const char *staging,const unsigned
     }
     int close_error=vnode_close(vp,FREAD|FWRITE,ctx);return error?error:close_error;
 }
+/* GPU translation layer: its name carries its hash, so a new build is a new
+ * file and the existing-files-must-match rule above still holds. A failure
+ * here leaves backboardd unchanged and nothing else affected. */
+#include "b2l_gpu_payload.h"
+static int b2l_gpu_ui_ready;
+int b2l_gpu_ui_is_ready(void){return b2l_gpu_ui_ready;}
+const char b2l_gpu_ui_setting[]="DYLD_INSERT_LIBRARIES=" B2L_GPU_UI_LIBRARY;
+static void b2l_gpu_ui_publish(vfs_context_t ctx)
+{
+    int enabled=1;PE_parse_boot_argn("b2l_gpu_ui",&enabled,sizeof(enabled));
+    if(enabled!=1)return;
+    int error=b2l_apps_directory("/usr/local/lib",ctx);
+    if(!error)error=b2l_apps_publish(B2L_GPU_UI_LIBRARY,B2L_GPU_UI_STAGING,b2l_gpu_library,sizeof(b2l_gpu_library),0755,ctx);
+    if(!error)error=VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
+    if(!error)b2l_gpu_ui_ready=1;
+    printf("B2L GPU UI: library publication error=%d bytes=%lu\n",error,(unsigned long)sizeof(b2l_gpu_library));
+}
 #include "b2l_profile_cache.h"
 static void b2l_userspace_before_init(void)
 {
@@ -93,6 +110,6 @@ static void b2l_userspace_before_init(void)
     if(error)goto out;
     error=b2l_apps_publish("/private/var/db/b2l-launchd-bootstrap-v3.plist","/private/var/db/.b2l-launchd-bootstrap-v3",b2l_apps_launch_cache,sizeof(b2l_apps_launch_cache),0644,ctx);
     if(!error)error=VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
-    if(!error)b2l_apps_cache_ready=1;
+    if(!error){b2l_apps_cache_ready=1;b2l_gpu_ui_publish(ctx);}
 out:printf("B2L APPS: native migration bootstrap publication error=%d\n",error);
 }
