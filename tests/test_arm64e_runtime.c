@@ -16,6 +16,9 @@
 #define PSR64_SS (1u<<21)
 static struct host_thread {struct {void *DebugData;} machine;} host_thread;
 static struct host_thread *current_thread(void){return &host_thread;}
+static int host_cpu;
+static int cpu_number(void){return host_cpu;}
+#include <stddef.h>
 #define MACH_VM_MAX_ADDRESS UINT64_C(0x1000000000)
 #define VM_PROT_EXECUTE 4
 #define VM_SANITIZE_CALLER_USERACC 1
@@ -50,8 +53,8 @@ static unsigned map_locked, map_locks, map_unlocks;
 static uint64_t child_shift;
 static uint64_t leaf_start=0x1000, leaf_size=0x3000;
 static uint8_t memory[0x4000];
-static int boot_flag, siphash_flag = -1, pair_flag = -1;
-static bool PE_parse_boot_argn(const char *n,void *p,size_t z){assert(z==sizeof(int));if(!strcmp(n,"b2l_arm64e_compat")){memcpy(p,&boot_flag,z);return true;}if(!strcmp(n,"b2l_pacga_siphash")){if(siphash_flag<0)return false;memcpy(p,&siphash_flag,z);return true;}assert(!strcmp(n,"b2l_pacga_pair"));if(pair_flag<0)return false;memcpy(p,&pair_flag,z);return true;}
+static int boot_flag, siphash_flag = -1, pair_flag = -1, precompiled_flag = -1, keyless_flag = -1;
+static bool PE_parse_boot_argn(const char *n,void *p,size_t z){assert(z==sizeof(int));if(!strcmp(n,"b2l_arm64e_compat")){memcpy(p,&boot_flag,z);return true;}if(!strcmp(n,"b2l_pacga_siphash")){if(siphash_flag<0)return false;memcpy(p,&siphash_flag,z);return true;}if(!strcmp(n,"b2l_precompiled")){if(precompiled_flag<0)return false;memcpy(p,&precompiled_flag,z);return true;}if(!strcmp(n,"b2l_pacga_keyless")){if(keyless_flag<0)return false;memcpy(p,&keyless_flag,z);return true;}assert(!strcmp(n,"b2l_pacga_pair"));if(pair_flag<0)return false;memcpy(p,&pair_flag,z);return true;}
 static bool b2l_arm64e_current_task(void){return task_compat;}
 static bool is_saved_state64(arm_saved_state_t*s){return s->user64;}
 #define PSR64_IS_USER64(c) (((c)&15)==0)
@@ -143,6 +146,65 @@ static void expected_step(arm_saved_state_t *s,uint32_t op){
  if(rd==29)s->fp=v;else if(rd==30)s->lr=v;else if(rd<29)s->x[rd]=v;
  s->pc+=4;
 }
+static void precompiled_tests(void){
+ /* Opt-in requires the enabled runtime; absent/zero/other values stay off. */
+ int old_boot=boot_flag;boot_flag=0;precompiled_flag=1;b2l_compat_init();assert(!b2l_arm64e_precompiled());boot_flag=old_boot;
+ for(int flag=-1;flag<=2;flag++)if(flag!=1){precompiled_flag=flag;b2l_compat_init();assert(!b2l_arm64e_precompiled());}
+ /* Baseline: current and next PC each take one execute lookup. */
+ arm_saved_state_t s=initial();unsigned q=region_queries;
+ assert(b2l_arm64e_compat_emulate(&s,0xd65f0fff)&&s.pc==0x1800&&region_queries==q+2);
+ uint64_t before[2],after[2];
+ precompiled_flag=1;b2l_compat_init();assert(b2l_arm64e_precompiled());b2l_arm64e_precompiled_snapshot(before);
+ /* Same-page return: no VM lookup and no instruction re-read. */
+ s=initial();q=region_queries;unsigned fetches=atomic32_calls;
+ assert(b2l_arm64e_compat_emulate(&s,0xd65f0fff)&&s.pc==0x1800&&s.cpsr==0xa0000000&&s.sp==0x2000);
+ assert(region_queries==q&&atomic32_calls==fetches);
+ b2l_arm64e_precompiled_snapshot(after);assert(after[0]==before[0]+2&&after[1]==before[1]);
+ /* Cross-page branch targets keep the lookup, the execute denial and bounds. */
+ s=initial();s.x[8]=0x2000;q=region_queries;
+ assert(b2l_arm64e_compat_emulate(&s,0xd73f0910)&&s.pc==0x2000&&s.lr==0x1004&&region_queries==q+1);
+ b2l_arm64e_precompiled_snapshot(after);assert(after[1]==before[1]+1);
+ s=initial();s.x[8]=0x2000;executable=false;rejected_unchanged(s,0xd73f0910);executable=true;
+ s=initial();s.x[8]=0x3000;leaf_size=0x2000;rejected_unchanged(s,0xd73f0910);leaf_size=0x3000;
+ s=initial();s.x[8]=UINT64_C(0xfffffff007000000);rejected_unchanged(s,0xd73f0910);
+ s=initial();s.x[8]=0x2002;rejected_unchanged(s,0xd73f0910);
+ /* Fall-through PACGA pays no lookup and no read; the trap path already fetched it. */
+ s=initial();q=region_queries;fetches=atomic32_calls;
+ assert(b2l_arm64e_compat_emulate(&s,pacga_word(0,1,2))&&s.pc==0x1004&&region_queries==q&&atomic32_calls==fetches);
+ /* Cross-page targets still read the instruction and reject an unreadable one. */
+ s=initial();s.x[8]=0x2000;copy_fault=true;rejected_unchanged(s,0xd73f0910);copy_fault=false;
+ /* Paired PACGA in precompiled mode: one read of the second word, no lookups. */
+ pair_flag=1;b2l_compat_init();{uint32_t second=pacga_word(3,4,5);memcpy(memory+0x1004,&second,4);
+  arm_saved_state_t want;s=initial();want=s;expected_step(&want,pacga_word(0,1,2));expected_step(&want,second);
+  q=region_queries;fetches=atomic32_calls;
+  assert(b2l_arm64e_compat_emulate(&s,pacga_word(0,1,2))&&!memcmp(&s,&want,sizeof(s)));
+  assert(region_queries==q&&atomic32_calls==fetches+1);memset(memory+0x1004,0,4);}
+ pair_flag=-1;b2l_compat_init();
+ /* Counters on different CPUs sum exactly. */
+ {uint64_t a[4],b[4];b2l_arm64e_compat_snapshot(a);host_cpu=5;s=initial();
+  assert(b2l_arm64e_compat_emulate(&s,0xd65f0fff));host_cpu=0;b2l_arm64e_compat_snapshot(b);
+  assert(b[0]==a[0]+1&&b[1]==a[1]+1);}
+ /* A fall-through onto the next page is a different page: lookup retained. */
+ s=initial();s.pc=0x1ffc;q=region_queries;assert(b2l_arm64e_compat_emulate(&s,pacga_word(0,1,2))&&s.pc==0x2000&&region_queries==q+1);
+ s=initial();s.pc=0x1ffc;executable=false;rejected_unchanged(s,pacga_word(0,1,2));executable=true;
+ /* Keyless PACGA: only with precompiled mode, equals the shared EL0 function,
+  * draws no entropy, and is reported in the LIVE label. */
+ keyless_flag=1;precompiled_flag=-1;b2l_compat_init();assert(!b2l_compat_keyless);
+ precompiled_flag=1;keyless_flag=2;b2l_compat_init();assert(!b2l_compat_keyless);
+ keyless_flag=1;b2l_compat_init();assert(b2l_compat_keyless&&!strcmp(b2l_arm64e_pacga_name(),"keyless"));
+ {unsigned before_entropy=entropy_calls;uint64_t rnd=UINT64_C(0x9e3779b97f4a7c15);
+  for(unsigned i=0;i<4096;i++){rnd=rnd*UINT64_C(6364136223846793005)+1;uint64_t a=rnd^(rnd>>17),b=rnd*31,v=0;
+   assert(!b2l_compat_pacga(a,b,&v,NULL)&&v==b2l_pacga_keyless(a,b)&&!(v&UINT32_MAX));}
+  s=initial();assert(b2l_arm64e_compat_emulate(&s,pacga_word(0,1,2))&&s.x[0]==b2l_pacga_keyless(s.x[1],s.x[2]));
+  /* Rm == 31 is SP for PACGA, the case the EL0 routine leaves to the kernel. */
+  s=initial();assert(b2l_arm64e_compat_emulate(&s,pacga_word(0,1,31))&&s.x[0]==b2l_pacga_keyless(s.x[1],s.sp));
+  assert(entropy_calls==before_entropy);}
+ keyless_flag=-1;b2l_compat_init();assert(!b2l_compat_keyless);
+ /* Leaving the mode restores both lookups. */
+ precompiled_flag=-1;b2l_compat_init();assert(!b2l_arm64e_precompiled());
+ s=initial();q=region_queries;assert(b2l_arm64e_compat_emulate(&s,0xd65f0fff)&&region_queries==q+2);
+ puts("Precompiled mode: opt-in gate, same-page lookup elision, cross-page/fault/denial retention and exit PASS");
+}
 static void pair_tests(void){
  uint32_t first=0x9aca3108,second=0x9ac83008,third=pacga_word(1,0,2);
  memcpy(memory+0x1004,&second,4);memcpy(memory+0x1008,&third,4);
@@ -152,9 +214,9 @@ static void pair_tests(void){
  for(int flag=-1;flag<=2;flag++)if(flag!=1){pair_flag=flag;b2l_compat_init();assert(!b2l_compat_pair);}
  pair_flag=1;b2l_compat_init();assert(b2l_compat_pair);
  arm_saved_state_t s=initial(),want=s;expected_step(&want,first);expected_step(&want,second);
- unsigned queries=region_queries;uint64_t before=b2l_compat_perf[4];
+ unsigned queries=region_queries;uint64_t pbefore[6];b2l_arm64e_perf_snapshot(pbefore);uint64_t before=pbefore[4];
  assert(b2l_arm64e_compat_emulate(&s,first));assert(!memcmp(&s,&want,sizeof(s)));
- assert(s.pc==0x1008&&region_queries==queries+3&&b2l_compat_perf[4]==before+1);
+ {uint64_t pafter[6];b2l_arm64e_perf_snapshot(pafter);assert(s.pc==0x1008&&region_queries==queries+3&&pafter[4]==before+1);}
  /* Never consume a third instruction, even another PACGA. */
  assert(s.x[1]==want.x[1]);
  /* Debug state and single-step must keep the one-instruction boundary. */
@@ -259,6 +321,7 @@ int main(int argc,char **argv){
  assert(b2l_compat_read_acquire(0x2001,2,&out,NULL));assert(b2l_compat_read_acquire(0x2000,0,&out,NULL));
  assert(!b2l_user_range(0,4)&&!b2l_user_range(UINT64_MAX-1,8)&&!b2l_user_range(MACH_VM_MAX_ADDRESS,4));
  copy_fault=true;assert(b2l_compat_read_acquire(0x2000,8,&out,NULL));copy_fault=false;
+ precompiled_tests();
  pair_tests();
  assert(!map_locked&&map_locks==map_unlocks);
  puts("Direct execute lookup: exact4-byte locks, constant-submap descent, parent bounds, holes/errors, unlock-before-copyin and no stale permission reuse PASS");

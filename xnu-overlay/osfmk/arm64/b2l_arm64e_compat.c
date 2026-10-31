@@ -27,33 +27,71 @@ extern void read_frandom(void *, unsigned int);
 #include <vm/memory_object_internal.h>
 #include <vm/vm_protos_internal.h>
 #include <sys/errno.h>
+#include <kern/cpu_number.h>
 extern void b2l_native_cache_observe(uint64_t,uint32_t);
 #endif
 #include "b2l_compat.h"
 #include "b2l_pacga_qarma5.h"
+#include "b2l_pacga_keyless.h"
 extern uint64_t b2l_pacga_qarma5_asm(uint64_t, uint64_t, uint64_t, uint64_t);
 extern uint64_t b2l_pacga_siphash(uint64_t, uint64_t, const uint64_t[2]);
+/* Smallest AArch64 translation granule; execute permission is never finer. */
+#define B2L_COMPAT_PAGE_SHIFT 12
 
 static bool b2l_compat_requested;
 /* Written only at TUNABLES, before any userspace object can be signed. */
 static bool b2l_compat_siphash;
 static bool b2l_compat_pair;
-/* Samples cover successful wrapper work only, not exception entry/return. */
-static uint64_t b2l_compat_perf[6];
-struct b2l_compat_measurement { bool sample; uint64_t vm_ticks, hash_ticks; };
-static uint64_t b2l_compat_telemetry[4];
+/* Precompiled-root mode: the host precompiler already rewrote every allowlisted
+ * site, so the cache learner is idle and same-page execute checks are elided. */
+static bool b2l_compat_precompiled;
+/* Keyless PACGA: must match the EL0 routines the precompiler placed in the root. */
+static bool b2l_compat_keyless;
+/* Samples cover successful wrapper work only, not exception entry/return.
+ * perf[0..3]: samples, wrapper/VM/hash ticks (1/1024 traps, low traffic). */
+static uint64_t b2l_compat_perf[4];
+struct b2l_compat_measurement { bool sample; uint64_t vm_ticks, hash_ticks, trapped_pc; };
+/* Every-trap counters live in per-CPU cache lines: eight CPUs incrementing one
+ * shared line on every trap made the counters a measurable share of the cost.
+ * Migration between cpu_number() and the add only picks another slot; relaxed
+ * atomics keep each slot exact. Snapshots sum the slots. */
+#define B2L_COMPAT_SLOTS 16u
+struct b2l_compat_slot {
+    uint64_t traps, done, paired, pair_fallback, elided, lookups;
+} __attribute__((aligned(128)));
+static struct b2l_compat_slot b2l_compat_slots[B2L_COMPAT_SLOTS];
+/* Last observed pid/pc, refreshed every 64th trap per CPU for diagnostics. */
+static uint64_t b2l_compat_last[2];
+static struct b2l_compat_slot *
+b2l_compat_slot(void)
+{
+    return &b2l_compat_slots[(unsigned)cpu_number() & (B2L_COMPAT_SLOTS - 1u)];
+}
+static uint64_t
+b2l_compat_sum(size_t field)
+{
+    uint64_t total = 0;
+    for (unsigned i = 0; i < B2L_COMPAT_SLOTS; i++)
+        total += __atomic_load_n((uint64_t *)((char *)&b2l_compat_slots[i] + field), __ATOMIC_RELAXED);
+    return total;
+}
 #ifndef B2L_COMPAT_HOST_TEST
 extern int proc_selfpid(void);
 #endif
 void b2l_arm64e_compat_snapshot(uint64_t values[4])
 {
-    for(unsigned i=0;i<4;i++)values[i]=__atomic_load_n(&b2l_compat_telemetry[i],__ATOMIC_RELAXED);
+    values[0]=b2l_compat_sum(offsetof(struct b2l_compat_slot,traps));
+    values[1]=b2l_compat_sum(offsetof(struct b2l_compat_slot,done));
+    values[2]=__atomic_load_n(&b2l_compat_last[0],__ATOMIC_RELAXED);
+    values[3]=__atomic_load_n(&b2l_compat_last[1],__ATOMIC_RELAXED);
 }
 
 void
 b2l_arm64e_perf_snapshot(uint64_t values[6])
 {
-    for (unsigned i=0;i<6;i++) values[i]=__atomic_load_n(&b2l_compat_perf[i],__ATOMIC_RELAXED);
+    for (unsigned i=0;i<4;i++) values[i]=__atomic_load_n(&b2l_compat_perf[i],__ATOMIC_RELAXED);
+    values[4]=b2l_compat_sum(offsetof(struct b2l_compat_slot,paired));
+    values[5]=b2l_compat_sum(offsetof(struct b2l_compat_slot,pair_fallback));
 #ifndef B2L_COMPAT_HOST_TEST
     for (unsigned i=1;i<=3;i++) {
         uint64_t ns=0;absolutetime_to_nanoseconds(values[i],&ns);values[i]=ns;
@@ -73,17 +111,28 @@ b2l_compat_init(void)
     int pair = 0;
     b2l_compat_pair = b2l_compat_requested &&
         PE_parse_boot_argn("b2l_pacga_pair", &pair, sizeof(pair)) && pair == 1;
+    int precompiled = 0;
+    b2l_compat_precompiled = b2l_compat_requested &&
+        PE_parse_boot_argn("b2l_precompiled", &precompiled, sizeof(precompiled)) && precompiled == 1;
+    int keyless = 0;
+    b2l_compat_keyless = b2l_compat_precompiled &&
+        PE_parse_boot_argn("b2l_pacga_keyless", &keyless, sizeof(keyless)) && keyless == 1;
     if (b2l_compat_requested) {
         /* TUNABLES runs before log_lock initialization. Use only the
          * already mapped, lock-free early framebuffer sink here. */
         const char *message = "B2L ARM64e: development stripped-pointer runtime enabled; hardware PAC unchanged\n";
         while (*message) b2l_early_putc(*message++);
-        message = b2l_compat_siphash ?
+        message = b2l_compat_keyless ?
+            "B2L PACGA: keyless (matches precompiled EL0 routines)\n" : b2l_compat_siphash ?
             "B2L PACGA: SipHash-2-4 experimental boot ABI; immutable boot key\n" :
             "B2L PACGA: QARMA5; immutable boot key\n";
         while (*message) b2l_early_putc(*message++);
         if (b2l_compat_pair) {
             message="B2L PACGA: bounded adjacent pair enabled; execute checks retained\n";
+            while (*message) b2l_early_putc(*message++);
+        }
+        if (b2l_compat_precompiled) {
+            message="B2L ARM64e: precompiled root mode; cache learning off, same-page execute checks elided\n";
             while (*message) b2l_early_putc(*message++);
         }
     }
@@ -96,10 +145,24 @@ b2l_arm64e_compat_enabled(void)
     return b2l_compat_requested;
 }
 
+bool
+b2l_arm64e_precompiled(void)
+{
+    return b2l_compat_precompiled;
+}
+
+void
+b2l_arm64e_precompiled_snapshot(uint64_t values[2])
+{
+    values[0]=b2l_compat_sum(offsetof(struct b2l_compat_slot,elided));
+    values[1]=b2l_compat_sum(offsetof(struct b2l_compat_slot,lookups));
+}
+
 const char *
 b2l_arm64e_pacga_name(void)
 {
     if (!b2l_compat_requested) return "disabled";
+    if (b2l_compat_keyless) return "keyless";
     return b2l_compat_siphash ? "siphash24" : "qarma5";
 }
 
@@ -169,23 +232,36 @@ b2l_compat_validate_pc(uint64_t address, void *opaque)
      * exclusive VM object locks even for SHORT_INFO. None of that metadata is
      * needed for this permission check. Never cache an unlocked permission. */
     struct b2l_compat_measurement *measurement=opaque;
-    uint64_t began=measurement && measurement->sample ? mach_absolute_time() : 0;
-    VM_MAP_LOCK_CTX_DECLARE(ctx);
-    vm_map_t map=current_map();
-    kern_return_t kr=vm_map_range_sh_lock(ctx,&map,address,address+sizeof(instruction),
-        VMRL_SH_STREAM_NO_HOLES | VMRL_SH_DESCEND_INTO_CONSTANT);
     bool executable=false;
-    if (kr==KERN_SUCCESS) {
-        vm_map_entry_t entry=vm_map_range_stream_next_with_error(ctx,&kr);
-        if (kr==KERN_SUCCESS && entry && !entry->is_sub_map &&
-            (entry->protection & VM_PROT_EXECUTE)) {
-            vm_map_address_t start=0,end=0;
-            vm_map_lock_ctx_bounds_in_parent(ctx,&start,&end,NULL);
-            executable=start<=address && end>=address+sizeof(instruction);
+    if (b2l_compat_precompiled && measurement && measurement->trapped_pc &&
+        (address >> B2L_COMPAT_PAGE_SHIFT) == (measurement->trapped_pc >> B2L_COMPAT_PAGE_SHIFT)) {
+        /* The CPU just fetched the trapped instruction from this 4 KiB page and
+         * the trap path read it back, so the page is mapped and executable.
+         * Permission cannot differ inside one granule, and returning to EL0
+         * re-enforces it in hardware: an unmap racing with this trap becomes an
+         * ordinary instruction abort, exactly as for native code. Neither the
+         * VM lookup nor a second instruction read adds information here. */
+        __atomic_fetch_add(&b2l_compat_slot()->elided,1,__ATOMIC_RELAXED);
+        return 0;
+    } else {
+        uint64_t began=measurement && measurement->sample ? mach_absolute_time() : 0;
+        VM_MAP_LOCK_CTX_DECLARE(ctx);
+        vm_map_t map=current_map();
+        kern_return_t kr=vm_map_range_sh_lock(ctx,&map,address,address+sizeof(instruction),
+            VMRL_SH_STREAM_NO_HOLES | VMRL_SH_DESCEND_INTO_CONSTANT);
+        if (kr==KERN_SUCCESS) {
+            vm_map_entry_t entry=vm_map_range_stream_next_with_error(ctx,&kr);
+            if (kr==KERN_SUCCESS && entry && !entry->is_sub_map &&
+                (entry->protection & VM_PROT_EXECUTE)) {
+                vm_map_address_t start=0,end=0;
+                vm_map_lock_ctx_bounds_in_parent(ctx,&start,&end,NULL);
+                executable=start<=address && end>=address+sizeof(instruction);
+            }
+            vm_map_range_sh_unlock(ctx,&map);
         }
-        vm_map_range_sh_unlock(ctx,&map);
+        if (measurement && measurement->sample) measurement->vm_ticks += mach_absolute_time()-began;
+        if (b2l_compat_precompiled) __atomic_fetch_add(&b2l_compat_slot()->lookups,1,__ATOMIC_RELAXED);
     }
-    if (measurement && measurement->sample) measurement->vm_ticks += mach_absolute_time()-began;
     if (!executable) return -1;
     /* Release all map locks BEFORE faultable instruction copyin. */
     if (trace) b2l_early_trace("B2L COMPAT: execute-map check passed; copyin begin\n");
@@ -200,6 +276,12 @@ b2l_compat_pacga(uint64_t a, uint64_t b, uint64_t *out, void *opaque)
     if (!out || !b2l_compat_requested) return -1;
     struct b2l_compat_measurement *measurement=opaque;
     uint64_t began=measurement && measurement->sample ? mach_absolute_time() : 0;
+    if (b2l_compat_keyless) {
+        /* Same function as the EL0 routines; no key, no lock, no entropy. */
+        *out = b2l_pacga_keyless(a, b);
+        if (measurement && measurement->sample) measurement->hash_ticks += mach_absolute_time()-began;
+        return 0;
+    }
     /* First invocation is an EL0 trap after BSD startup and PRNG registration.
      * One key and one algorithm cover every task and CPU for the entire boot.
      * Release publishes the completed key; acquire readers never need a mutex.
@@ -240,13 +322,17 @@ b2l_arm64e_compat_emulate(arm_saved_state_t *state, uint32_t instruction)
         !PSR64_IS_USER64(get_saved_state_cpsr(state)) ||
         !b2l_arm64e_current_task()) return false;
     if (trace) b2l_early_trace("B2L COMPAT: process and EL0 gates passed\n");
-    uint64_t ticket=__atomic_fetch_add(&b2l_compat_telemetry[0],1,__ATOMIC_RELAXED);
-    struct b2l_compat_measurement measurement={.sample=(ticket & 1023u)==0};
+    struct b2l_compat_slot *slot=b2l_compat_slot();
+    uint64_t ticket=__atomic_fetch_add(&slot->traps,1,__ATOMIC_RELAXED);
+    struct b2l_compat_measurement measurement={.sample=(ticket & 1023u)==0,
+        .trapped_pc=get_saved_state_pc(state)};
     uint64_t began=measurement.sample ? mach_absolute_time() : 0;
+    if (!(ticket & 63u)) {
 #ifndef B2L_COMPAT_HOST_TEST
-    __atomic_store_n(&b2l_compat_telemetry[2],(uint64_t)proc_selfpid(),__ATOMIC_RELAXED);
+        __atomic_store_n(&b2l_compat_last[0],(uint64_t)proc_selfpid(),__ATOMIC_RELAXED);
 #endif
-    __atomic_store_n(&b2l_compat_telemetry[3],get_saved_state_pc(state),__ATOMIC_RELAXED);
+        __atomic_store_n(&b2l_compat_last[1],get_saved_state_pc(state),__ATOMIC_RELAXED);
+    }
     struct b2l_compat_ctx context = {0};
     for (unsigned i = 0; i < 29; ++i) context.x[i] = get_saved_state_reg(state, i);
     context.x[29] = get_saved_state_fp(state);
@@ -280,22 +366,23 @@ b2l_arm64e_compat_emulate(arm_saved_state_t *state, uint32_t instruction)
          * Debug contexts and software single-step retain one-instruction traps. */
         uint32_t following=0;
         if (copyin_atomic32(context.pc,&following)) {
-            __atomic_fetch_add(&b2l_compat_perf[5],1,__ATOMIC_RELAXED);
+            __atomic_fetch_add(&slot->pair_fallback,1,__ATOMIC_RELAXED);
         } else if (b2l_compat_is_pacga(following)) {
             struct b2l_compat_ctx candidate=context;
             if (b2l_compat_emulate(following,&candidate,&operations)==B2L_COMPAT_OK) {
                 context=candidate;
-                __atomic_fetch_add(&b2l_compat_perf[4],1,__ATOMIC_RELAXED);
+                __atomic_fetch_add(&slot->paired,1,__ATOMIC_RELAXED);
             } else {
-                __atomic_fetch_add(&b2l_compat_perf[5],1,__ATOMIC_RELAXED);
+                __atomic_fetch_add(&slot->pair_fallback,1,__ATOMIC_RELAXED);
             }
         }
     }
 #ifndef B2L_COMPAT_HOST_TEST
-    /* Enqueue only after successful emulation, using the original PC. */
-    b2l_native_cache_observe(get_saved_state_pc(state),instruction);
+    /* Enqueue only after successful emulation, using the original PC. A
+     * precompiled root has nothing left for the learner to convert. */
+    if (!b2l_compat_precompiled) b2l_native_cache_observe(get_saved_state_pc(state),instruction);
 #endif
-    __atomic_fetch_add(&b2l_compat_telemetry[1],1,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&slot->done,1,__ATOMIC_RELAXED);
     for (unsigned i = 0; i < 29; ++i) set_user_saved_state_reg(state, i, context.x[i]);
     set_saved_state_fp(state, context.x[29]);
     set_user_saved_state_lr(state, context.x[30]);

@@ -25,8 +25,9 @@ static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
         if(++reports==6){
             uint64_t v[4];b2l_arm64e_compat_snapshot(v);reports=0;
             uint64_t perf[6];b2l_arm64e_perf_snapshot(perf);
-            b2l_early_trace("B2L EMU PERF: samples=%llu wrapper_ns=%llu vm_ns=%llu hash_ns=%llu paired=%llu pair_fallback=%llu\n",
-                perf[0],perf[1],perf[2],perf[3],perf[4],perf[5]);
+            uint64_t elided[2];b2l_arm64e_precompiled_snapshot(elided);
+            b2l_early_trace("B2L EMU PERF: samples=%llu wrapper_ns=%llu vm_ns=%llu hash_ns=%llu paired=%llu pair_fallback=%llu elided=%llu lookups=%llu\n",
+                perf[0],perf[1],perf[2],perf[3],perf[4],perf[5],elided[0],elided[1]);
             b2l_diag_progress();
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
             b2l_early_trace("B2L LIVE: traps=%llu done=%llu pid=%llu pc=0x%llx flush_errors=%llu last_error=%d sec=%llu pacga=%s\n",

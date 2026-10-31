@@ -98,6 +98,11 @@ mismatch; the0101 fix is compiled and tested but **not installed**. Native
 migration still needs [HFS staging compatibility](docs/hfs-apfs-installation.md),
 and the failed one-attempt receipt is preserved.
 
+[0102](docs/build-0102.md) adds the host [offline precompiler](docs/arm64e-precompile.md)
+and the `b2l_precompiled=1` kernel mode that skips the cache apply/learning
+pass and same-page execute lookups. Its host tests pass; **the 0102 kernel and
+BOOT image have not been built or installed**, and device timing is pending.
+
 | Component | Device status | How it works / current limits |
 | --- | --- | --- |
 | Boot chain and XNU startup | Verified | S-Boot loads the packaged UEFI firmware. The embedded EFI loader reads XNU from the BOOT trailer, builds Apple `boot_args`/device tree and hands control to XNU. |
@@ -105,8 +110,8 @@ and the failed one-attempt receipt is preserved.
 | RAM | Partial: 6976MiB owned at0090 startup | [0087](docs/build-0087.md) retains the primary arena and adds separately owned conventional-memory spans. Fixed firmware/EL2/display reservations and physical gaps are excluded. The whitelist ceiling is about7045MiB;0090 reports6976MiB owned across13 spans and reaches userspace. Long-run allocator coverage remains incomplete. |
 | Native UFS storage | Verified | XNU accesses the Exynos UFS controller directly after the EFI handoff, with GPT partition discovery, bounded reads/writes, flush and readback. Storage is not emulated by a host computer. |
 | Root filesystem | Verified: read/write | The Apple OSS HFS driver mounts the journaled HFS root inside USERDATA and performs journal replay. This port uses HFS rather than native iOS APFS. |
-| ARM64e userspace | Partial | Kernel traps emulate supported instructions missing on Exynos, including authenticated control flow and LDAPR. This allows real launchd, dyld and iOS services to execute; it does not provide hardware pointer-authentication security or universal instruction coverage. |
-| Persistent native-code cache | Verified | Four workers learn eligible executed instructions and commit checked A/B records to a roughly 5.52 GiB SYSTEM cache file. A 1.5 MiB RAM hot window and disk index avoid keeping the whole file in RAM. On the next normal boot, XNU applies matching pages to the HFS root before launchd, archives undo data and reclaims applied cells. This is selective reuse, not a complete offline ARM64e conversion. See [cache lifecycle](docs/native-cache.md). |
+| ARM64e userspace | Partial | Kernel traps emulate supported instructions missing on Exynos, including authenticated control flow and LDAPR. This allows real launchd, dyld and iOS services to execute; it does not provide hardware pointer-authentication security or universal instruction coverage. The host [offline precompiler](docs/arm64e-precompile.md) now rewrites every convertible PAC/AUT/XPAC, authenticated branch/return and LDAPR word in the prepared root before flashing, using the kernel's own converter; PACGA and LDRA sites still trap. Device timing with a precompiled root is pending. |
+| Persistent native-code cache | Verified | Four workers learn eligible executed instructions and commit checked A/B records to a roughly 5.52 GiB SYSTEM cache file. A 1.5 MiB RAM hot window and disk index avoid keeping the whole file in RAM. On the next normal boot, XNU applies matching pages to the HFS root before launchd, archives undo data and reclaims applied cells. This is selective reuse of executed sites; the [offline precompiler](docs/arm64e-precompile.md) performs the complete allowlisted conversion on the host, leaving the cache as a fallback. See [cache lifecycle](docs/native-cache.md). |
 | Display and SpringBoard UI | Partial; Settings opens on0099 | Native QuartzCore software rendering submits IOSurfaces; the B2L framebuffer path copies supported BGRA layers to physical scanout using the CPU. 0092 reaches the lock screen in about90s by owner timing and touch works. The owner reports malformed icons and a black screen after tapping Settings; CoreImage render failures are logged, but causality for the black screen is unresolved. See [CPU presentation](docs/build-0061.md). |
 | Source-image application migration | Blocked: native staging requires APFS | The owned arm64e helper invokes the shipped SystemAppMigrator once;0099 finds50 candidates but installs0. MIStagingManager rejects the HFS volume with error166. A real HFS-compatible staging path and native desired-state handling remain required. |
 | GPU acceleration | Not implemented | There is no working Mali graphics driver for this iOS stack. Visible frames currently use the CPU presentation path. |
@@ -234,6 +239,12 @@ SDKs, KDKs, IPSWs and local upstream source checkouts are not committed.
    `scripts/build-boot-firmware.sh` in a disposable Mu work tree.
 5. Create the image with `scripts/package-boot.py` as described in
    [packaging](docs/packaging.md).
+6. Before flashing a prepared iOS root, run `scripts/build-precompile.sh` and
+   `out/b2l-precompile --write` over the mounted root as described in
+   [offline precompilation](docs/arm64e-precompile.md).
+
+The scripted kernel and firmware build for the second unit,
+with every pinned revision, is in [build 0105](docs/build-0105.md).
 
 ## Verification and device boundary
 
@@ -241,6 +252,7 @@ SDKs, KDKs, IPSWs and local upstream source checkouts are not committed.
 scripts/test-loader.sh
 scripts/inspect-kernel.sh /path/to/mach.development.b2l
 python3 scripts/package-boot.py --verify /path/to/boot.img
+scripts/test-precompile.sh
 ```
 
 Host checks cover malformed Mach-O input, Apple device-tree bounds, the exact
