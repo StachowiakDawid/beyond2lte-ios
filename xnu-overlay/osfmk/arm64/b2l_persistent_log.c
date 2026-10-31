@@ -16,12 +16,18 @@ void b2l_log_append(char c){b2l_log_ring_append(&console_ring,(uint8_t)c);}
 void b2l_log_append_bytes(const void*p,size_t n){b2l_log_ring_append_bytes(&console_ring,p,n);}
 static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
 {
-    unsigned reports=0;
+    unsigned reports=0,ticks=0;
     for(;;){
+        /* For the first 300 s, drain every second and leave a TICK line, so
+         * the last line on disk dates a stall to within about one second. */
+        uint64_t up=0;absolutetime_to_nanoseconds(mach_absolute_time(),&up);up/=NSEC_PER_SEC;
+        bool early=up<300;
+        if(early)b2l_early_trace("B2L TICK sec=%llu\n",up);
         int err=b2l_log_writer_drain(&disk_writer,&console_ring,128);
         if(err){__atomic_fetch_add(&flush_failures,1,__ATOMIC_RELAXED);__atomic_store_n(&last_error,err,__ATOMIC_RELAXED);}
         /* Outside every storage lock/callback. One bounded progress line per
          * ~30s distinguishes an awake scheduler from silent EL0 execution. */
+        if(early){if(++ticks<5)goto sleep;ticks=0;}
         if(++reports==6){
             uint64_t v[4];b2l_arm64e_compat_snapshot(v);reports=0;
             uint64_t perf[6];b2l_arm64e_perf_snapshot(perf);
@@ -33,7 +39,8 @@ static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
             b2l_early_trace("B2L LIVE: traps=%llu done=%llu pid=%llu pc=0x%llx flush_errors=%llu last_error=%d sec=%llu pacga=%s\n",
                 v[0],v[1],v[2],v[3],__atomic_load_n(&flush_failures,__ATOMIC_RELAXED),__atomic_load_n(&last_error,__ATOMIC_RELAXED),ns/1000000000,b2l_arm64e_pacga_name());
         }
-        assert_wait_timeout((event_t)&disk_writer,THREAD_UNINT,5,NSEC_PER_SEC);
+sleep:
+        assert_wait_timeout((event_t)&disk_writer,THREAD_UNINT,early?1:5,NSEC_PER_SEC);
         thread_block(THREAD_CONTINUE_NULL);
     }
 }

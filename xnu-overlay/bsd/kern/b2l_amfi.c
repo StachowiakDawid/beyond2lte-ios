@@ -110,6 +110,14 @@ int b2l_amfi_proc_copy_identity(proc_t process,void**out,size_t*length)
     void*e=proc_copy_ent(process);int error=b2l_ent_copy_identity(e,out,length);
     b2l_ent_release(e);return error;
 }
+/* The retained entitlement object, for the b2l_ent_* queries; NULL if none.
+ * b2l_amfi_proc_copy_dict returns the plain OSDictionary, which those queries
+ * do not accept. */
+int b2l_amfi_proc_copy_ent(proc_t process,void **out)
+{
+    if(!out)return EINVAL;
+    *out=proc_copy_ent(process);return 0;
+}
 int b2l_amfi_proc_copy_dict(proc_t process,void **out)
 {
     if(!out)return EINVAL;*out=NULL;
