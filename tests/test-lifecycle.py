@@ -88,6 +88,8 @@ int main(void){
  struct proc p={b,CS_PLATFORM_BINARY};void*copied_dict=NULL;assert(!b2l_amfi_proc_copy_dict(&p,&copied_dict)&&copied_dict==b->label.value);b2l_ent_release(copied_dict);assert(b2l_amfi_is_platform(&p));p.flags=0;assert(!b2l_amfi_is_platform(&p));p.flags=CS_PLATFORM_BINARY;
  void*out=(void*)1;size_t n=9;assert(!b2l_amfi_proc_copy_xml(&p,&out,&n)&&n==4);free(out);
  out=(void*)1;n=9;assert(!b2l_amfi_proc_copy_der(&p,&out,&n)&&n==4);free(out);
+ /* No DER metadata: success with an empty blob (native zero header), never ENOENT. */
+ {struct proc bare={cred_new(NULL),0};out=(void*)1;n=9;assert(!b2l_amfi_proc_copy_der(&bare,&out,&n)&&out==NULL&&n==0);cred_drop(bare.cred);}
  out=(void*)1;n=9;assert(!b2l_amfi_proc_copy_identity(&p,&out,&n)&&n==sizeof("example.fixture"));free(out);
  struct cred*replacement=cred_new(b2l_ent_create(false));swap_cred=replacement;void*held=proc_copy_ent(&p);assert(b2l_ent_platform(held)&&p.cred==replacement&&((struct ent*)held)->refs==1);b2l_ent_release(held);assert(!b2l_amfi_is_platform(&p));
  struct cred*c=cred_new(NULL);label_associate(p.cred,c);next_ent=b2l_ent_create(true);unsigned flags=0x100;int disjoint=1;
