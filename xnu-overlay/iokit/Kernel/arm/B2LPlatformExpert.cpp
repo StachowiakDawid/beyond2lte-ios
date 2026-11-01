@@ -7,6 +7,7 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOKitKeys.h>
+#include <IOKit/IOUserClient.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSString.h>
 #include <pexpert/pexpert.h>
@@ -23,6 +24,32 @@ public:
 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(B2LPlatformExpert, IODTPlatformExpert);
+
+/*
+ * configd's InterfaceNamer reports nothing until it has opened this service, or
+ * until its timeout passes, and everything that lists network interfaces waits for
+ * that report: Settings froze behind it. The real class lives in IONetworkingFamily,
+ * which this kernel does not have. configd only uses the connection to register
+ * interfaces, and this port has none, so the user client has no methods.
+ */
+class IONetworkStack : public IOService {
+	OSDeclareDefaultStructors(IONetworkStack);
+};
+OSDefineMetaClassAndStructors(IONetworkStack, IOService);
+
+class IONetworkStackUserClient : public IOUserClient {
+	OSDeclareDefaultStructors(IONetworkStackUserClient);
+public:
+	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+};
+OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
+
+IOReturn
+IONetworkStackUserClient::clientClose(void)
+{
+	terminate();
+	return kIOReturnSuccess;
+}
 
 extern "C" void b2l_power_init(void);
 extern "C" bool b2l_power_halt_restart(unsigned int type);
@@ -61,6 +88,12 @@ B2LPlatformExpert::start(IOService *provider)
     if(PE_get_default("sleep-disabled",&sleepDisabled,sizeof(sleepDisabled)) && sleepDisabled)
         IOLog("B2L PM: system sleep disabled until CPU suspend/resume support is available\n");
 	registerService();
+	IONetworkStack *stack = OSTypeAlloc(IONetworkStack);
+	if (stack != nullptr && stack->init() && stack->attach(this)) {
+		stack->setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");
+		stack->registerService();
+	}
+	OSSafeReleaseNULL(stack);
 	IOLog("B2L: platform expert registered; software product iPhone17,2, Samsung B2L hardware\n");
 	return true;
 }

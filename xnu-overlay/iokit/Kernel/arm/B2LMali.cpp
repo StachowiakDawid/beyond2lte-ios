@@ -42,6 +42,25 @@
 #include "b2l_acpm.h"
 #include "B2LSurface.h"
 
+extern "C" void b2l_task_dump(const char *name);
+extern "C" void b2l_cpu_clock_measure(void);
+extern "C" void b2l_cpu_load_sample(uint64_t *busy, uint64_t *idle);
+
+/*
+ * The boot chain's rates and the sustained ones. The targets are entries in the
+ * device tree's tables that ask nothing of the memory clock, and big stops at the
+ * rate Android boots with, the highest allowed without the overcurrent driver.
+ */
+static const struct {
+	const char *name;
+	uint32_t domain, boot_khz, boost_khz, warm_khz;
+} b2l_cpu_clusters[] = {
+	{ "cl0", B2L_DVFS_CPUCL0, 1053000, 1586000, 1586000 },
+	{ "cl1", B2L_DVFS_CPUCL1, 1222000, 2002000, 2002000 },
+	{ "cl2", B2L_DVFS_CPUCL2, 1378000, 2080000, 1560000 },
+};
+#define B2L_CPU_CLUSTERS (sizeof(b2l_cpu_clusters) / sizeof(b2l_cpu_clusters[0]))
+
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" int proc_selfpid(void);
 extern "C" ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
@@ -105,6 +124,16 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_GPU_MAX_KHZ        702000
 #define B2L_GPU_HOT_C          85
 #define B2L_GPU_COOL_C         75
+#define B2L_CPU_BIG_HOT_C      80              /* the big sensor: only that cluster steps down */
+#define B2L_CPU_BIG_COOL_C     70
+#define B2L_CPU_ALL_HOT_C      88              /* any sensor: every cluster goes to its boot rate */
+#define B2L_CPU_ALL_COOL_C     78
+#define B2L_CPU_POLL_MS        250
+#define B2L_CPU_LOAD_UP        15              /* percent of all CPUs: about one core busy */
+#define B2L_CPU_LOAD_DOWN      8
+#define B2L_CPU_QUIET_POLLS    12              /* 3 s under the lower mark */
+#define B2L_CPU_TEMP_POLLS     8               /* polls per temperature reading */
+#define B2L_CPU_REPORT_READS   8               /* readings per log line */
 #define B2L_GPU_TEMP_EVERY_NS  2000000000ull
 #define B2L_GPU_STATS_EVERY    5               /* temperature readings per log line */
 
@@ -130,6 +159,7 @@ class B2LMali : public IOService {
 	static void ioWrite(void *ctx, uint32_t offset, uint32_t value);
 	static void ioDelay(void *ctx, uint32_t us);
 	static void threadMain(void *owner, wait_result_t result);
+	static void clusterMain(void *owner, wait_result_t result);
 	static uint64_t nowNS();
 
 	bool readPowerDomain();
@@ -164,6 +194,9 @@ class B2LMali : public IOService {
 	static void acpmMailboxWrite(void *ctx, uint32_t offset, uint32_t value);
 	void acpmDump();
 	void readTemperatures(int *temperatures);
+	void busyDump(unsigned second);
+	bool setCluster(unsigned cluster, uint32_t khz);
+	void clusterBoost();
 	void acpmStart();
 	void gpuClock(bool busy);
 	void checkTemperature();
@@ -677,6 +710,153 @@ B2LMali::acpmDump()
 	}
 }
 
+/* Who keeps IOKit from going quiet, and where the daemons behind Settings are. */
+void
+B2LMali::busyDump(unsigned second)
+{
+	IOService *root = IOService::getServiceRoot();
+	unsigned listed = 0;
+
+	b2l_diag_record("B2L BUSY: sec=%u root=%u\n", second, root ? root->getBusyState() : 0);
+	IORegistryIterator *services = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
+	while (services != NULL && listed < 24) {
+		IOService *service = OSDynamicCast(IOService, services->getNextObject());
+		if (service == NULL) {
+			if (services->isValid()) {
+				break;
+			}
+			services->reset();
+			continue;
+		}
+		if (service->getBusyState() != 0) {
+			b2l_diag_record("B2L BUSY: %s (%s) %u\n", service->getName(), service->getMetaClass()->getClassName(),
+			    service->getBusyState());
+			listed++;
+		}
+	}
+	OSSafeReleaseNULL(services);
+	b2l_task_dump("configd");
+	b2l_task_dump("timed");
+	IOSleep(B2L_GPU_LOG_DRAIN_MS);
+}
+
+bool
+B2LMali::setCluster(unsigned cluster, uint32_t khz)
+{
+	IOLockLock(runtimeLock);
+	int answered = acpmReady && b2l_acpm_set_rate(&acpm, &acpmDvfs, b2l_cpu_clusters[cluster].domain, khz);
+	IOLockUnlock(runtimeLock);
+	if (!answered) {
+		b2l_diag_record("B2L ACPM: %s %u kHz got no reply\n", b2l_cpu_clusters[cluster].name, khz);
+	}
+	return answered;
+}
+
+/*
+ * The CPUs run fast only under load: left high, an idle phone reached 80 C in 0139.
+ * Under load the big cores heat far faster than the rest, so they alone step down
+ * when hot. Any sensor past the higher mark stops the boost until it cools, and a
+ * lost sensor ends it.
+ */
+void
+B2LMali::clusterBoost()
+{
+	static const unsigned dumps[] = { 60, 120 };
+	int enabled = 1;
+	PE_parse_boot_argn("b2l_cpu_boost", &enabled, sizeof(enabled));
+	IOLockLock(runtimeLock);
+	bool ready = acpmReady && tmuReady;
+	IOLockUnlock(runtimeLock);
+	if (!ready) {
+		b2l_diag_record("B2L ACPM: CPU clocks left alone, no sensors\n");
+		return;
+	}
+	struct b2l_acpm_load load = { 0, 0 };
+	int bigWarm = 0, holding = 0;
+	bool measured = false;
+	unsigned dumped = 0, changes = 0, reads = 0, percent = 0;
+	uint32_t rates[B2L_CPU_CLUSTERS];
+
+	for (unsigned i = 0; i < B2L_CPU_CLUSTERS; i++) {
+		rates[i] = b2l_cpu_clusters[i].boot_khz;
+	}
+	uint64_t busy = 0, idle = 0;
+
+	b2l_cpu_load_sample(&busy, &idle);
+	for (unsigned poll = 1;; poll++) {
+		IOSleep(B2L_CPU_POLL_MS);
+		if (dumped < sizeof(dumps) / sizeof(dumps[0]) && nowNS() >= dumps[dumped] * 1000000000ull) {
+			busyDump(dumps[dumped++]);
+		}
+		uint64_t nowBusy, nowIdle;
+		b2l_cpu_load_sample(&nowBusy, &nowIdle);
+		uint64_t total = (nowBusy - busy) + (nowIdle - idle);
+		if (total != 0) {
+			percent = (unsigned)((nowBusy - busy) * 100 / total);
+			b2l_acpm_load_step(&load, percent, B2L_CPU_LOAD_UP, B2L_CPU_LOAD_DOWN, B2L_CPU_QUIET_POLLS);
+			busy = nowBusy;
+			idle = nowIdle;
+		}
+		if (poll % B2L_CPU_TEMP_POLLS == 0) {
+			int temperatures[B2L_TMU_COUNT], hottest = -1, lost = 0;
+			IOLockLock(runtimeLock);
+			readTemperatures(temperatures);
+			IOLockUnlock(runtimeLock);
+			for (unsigned i = 0; i < B2L_TMU_COUNT; i++) {
+				lost |= temperatures[i] < 0;
+				hottest = temperatures[i] > hottest ? temperatures[i] : hottest;
+			}
+			if (lost) {
+				b2l_diag_record("B2L ACPM: sensor lost, CPUs back at boot clocks\n");
+				for (unsigned i = 0; i < B2L_CPU_CLUSTERS; i++) {
+					setCluster(i, b2l_cpu_clusters[i].boot_khz);
+				}
+				return;
+			}
+			bigWarm = b2l_acpm_thermal_hold(bigWarm, temperatures[B2L_TMU_BIG], B2L_CPU_BIG_HOT_C, B2L_CPU_BIG_COOL_C);
+			int hold = b2l_acpm_thermal_hold(holding, hottest, B2L_CPU_ALL_HOT_C, B2L_CPU_ALL_COOL_C);
+			if (hold != holding) {
+				b2l_diag_record("B2L ACPM: hottest %d C, CPUs %s\n", hottest, hold ? "held at boot clocks" : "released");
+				holding = hold;
+			}
+			if (++reads % B2L_CPU_REPORT_READS == 0) {
+				b2l_diag_record("B2L ACPM: cpu big %d mid %d little %d g3d %d C load %u%% big %u kHz changes=%u holding=%d\n",
+				    temperatures[B2L_TMU_BIG], temperatures[B2L_TMU_MID], temperatures[B2L_TMU_LITTLE],
+				    temperatures[B2L_TMU_G3D], percent, rates[B2L_CPU_CLUSTERS - 1], changes, holding);
+			}
+		}
+		bool raised = false;
+		for (unsigned i = 0; i < B2L_CPU_CLUSTERS; i++) {
+			uint32_t want = b2l_cpu_clusters[i].boot_khz;
+			if (enabled && load.boosted && !holding) {
+				want = bigWarm ? b2l_cpu_clusters[i].warm_khz : b2l_cpu_clusters[i].boost_khz;
+			}
+			if (want != rates[i]) {
+				if (!setCluster(i, want)) {
+					return;
+				}
+				raised |= want == b2l_cpu_clusters[i].boost_khz;
+				rates[i] = want;
+				changes++;
+			}
+		}
+		if (raised && !measured) {
+			measured = true;
+			b2l_cpu_clock_measure();
+		}
+	}
+}
+
+void
+B2LMali::clusterMain(void *owner, wait_result_t result __unused)
+{
+	B2LMali *self = (B2LMali *)owner;
+
+	self->clusterBoost();
+	self->release();
+	thread_terminate(current_thread());
+}
+
 void
 B2LMali::readTemperatures(int *temperatures)
 {
@@ -753,6 +933,14 @@ B2LMali::acpmStart()
 		gpuBoostKHz = B2L_GPU_UNGUARDED_KHZ;
 	}
 	acpmReady = true;
+
+	thread_t thread;
+	retain();
+	if (kernel_thread_start(&B2LMali::clusterMain, this, &thread) != KERN_SUCCESS) {
+		release();
+		return;
+	}
+	thread_deallocate(thread);
 }
 
 void

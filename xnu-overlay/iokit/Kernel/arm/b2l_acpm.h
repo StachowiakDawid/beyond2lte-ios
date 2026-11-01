@@ -179,6 +179,36 @@ b2l_acpm_set_rate(const struct b2l_acpm_io *io, struct b2l_acpm_channel *dvfs, u
 	return b2l_acpm_call(io, dvfs, cmd);
 }
 
+/* Hold at the boot clocks from hot, and let go only at cool: 1 while holding. */
+static inline int
+b2l_acpm_thermal_hold(int holding, int hottest, int hot, int cool)
+{
+	if (hottest >= hot) {
+		return 1;
+	}
+	return hottest <= cool ? 0 : holding;
+}
+
+/* Rise at once on load, and fall only after a run of quiet samples. */
+struct b2l_acpm_load {
+	uint32_t quiet;
+	int boosted;
+};
+
+static inline void
+b2l_acpm_load_step(struct b2l_acpm_load *load, uint32_t percent, uint32_t up, uint32_t down, uint32_t quiet_limit)
+{
+	if (percent >= up) {
+		load->boosted = 1;
+		load->quiet = 0;
+	} else if (percent >= down) {
+		load->quiet = 0;
+	} else if (++load->quiet >= quiet_limit) {
+		load->boosted = 0;
+		load->quiet = quiet_limit;
+	}
+}
+
 /* Android's first TMU request: the firmware starts its sensors. 1 on a reply. */
 static inline int
 b2l_acpm_tmu_init(const struct b2l_acpm_io *io, struct b2l_acpm_channel *tmu)

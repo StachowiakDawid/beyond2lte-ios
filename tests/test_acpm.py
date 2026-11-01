@@ -84,6 +84,15 @@ int main(void) {
 
  rate[B2L_DVFS_G3D] = 156000;
  assert(b2l_acpm_tmu_init(&io, &t));
+ struct b2l_acpm_load load = { 0, 0 };
+ b2l_acpm_load_step(&load, 14, 15, 8, 3); assert(!load.boosted);
+ b2l_acpm_load_step(&load, 15, 15, 8, 3); assert(load.boosted);
+ for (int n = 0; n < 2; n++) { b2l_acpm_load_step(&load, 7, 15, 8, 3); assert(load.boosted); }
+ b2l_acpm_load_step(&load, 8, 15, 8, 3); assert(load.boosted && load.quiet == 0);
+ for (int n = 0; n < 2; n++) { b2l_acpm_load_step(&load, 0, 15, 8, 3); assert(load.boosted); }
+ b2l_acpm_load_step(&load, 0, 15, 8, 3); assert(!load.boosted);
+ assert(!b2l_acpm_thermal_hold(0, 79, 80, 70) && b2l_acpm_thermal_hold(0, 80, 80, 70));
+ assert(b2l_acpm_thermal_hold(1, 71, 80, 70) && !b2l_acpm_thermal_hold(1, 70, 80, 70));
  assert(rate_of(&d, B2L_DVFS_G3D) == 156000);
  assert(b2l_acpm_set_rate(&io, &d, B2L_DVFS_G3D, 433000) && rate[B2L_DVFS_G3D] == 433000);
  assert(rate_of(&d, B2L_DVFS_G3D) == 433000 && pending_cleared == 4);

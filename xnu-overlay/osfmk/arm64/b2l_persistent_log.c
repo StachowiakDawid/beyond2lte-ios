@@ -8,6 +8,21 @@
 #include <kern/clock.h>
 #include <mach/mach_time.h>
 #include "b2l_cpu_clock.h"
+#include "b2l_task_dump.h"
+void b2l_cpu_clock_measure(void){b2l_cpu_clock_report();}
+/* Scheduler ticks of all CPUs so far, for a load figure over an interval. */
+void b2l_cpu_load_sample(uint64_t*busy,uint64_t*idle)
+{
+    *busy=*idle=0;
+    for(unsigned cpu=0;cpu<real_ncpus&&cpu<16;cpu++){
+        processor_t processor=cpu_to_processor((int)cpu);
+        natural_t ticks[CPU_STATE_MAX]={0};
+        if(processor==PROCESSOR_NULL)continue;
+        processor_cpu_load_info(processor,ticks);
+        *busy+=(uint64_t)ticks[CPU_STATE_USER]+ticks[CPU_STATE_SYSTEM];
+        *idle+=ticks[CPU_STATE_IDLE];
+    }
+}
 static struct b2l_log_ring console_ring;
 static struct b2l_log_writer disk_writer;
 static uint32_t start_state;

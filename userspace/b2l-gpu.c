@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include "b2l_flush_rect.h"
 #include "b2l_mali_draw.h"
 #include "b2l_mali_uapi.h"
 
@@ -97,6 +98,7 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #define SHADOW_MAX_W 1440
 #define SHADOW_MAX_H 3040
 #define SHADOW_BYTES ((uint64_t)SHADOW_MAX_W * 4 * SHADOW_MAX_H)
+#define STAGE_BYTES (8ull * 1024 * 1024) /* images whose rows the GPU cannot read in place */
 #define MAX_QUADS 16
 #define PASS_DRAWS (MAX_QUADS + 1)
 #define TOLERANCE 2
@@ -149,8 +151,8 @@ static unsigned stat_count, compared_in_window;
 static uint64_t window_start, ticks_in_draws, draws_total, overflow;
 static mach_timebase_info_data_t timebase;
 static int shadow_ready, shadow_disabled, shadow_busy;
-static uint8_t *pass_cpu, *shadow_cpu;
-static uint64_t pass_va, shadow_va, code_va, heap_va;
+static uint8_t *pass_cpu, *shadow_cpu, *stage_cpu;
+static uint64_t pass_va, shadow_va, stage_va, code_va, heap_va;
 static uint32_t pass_type, heap_bytes;
 
 #define SHADER_TEXTURED  0x000
@@ -179,11 +181,22 @@ stat_for(const struct draw_key *key)
 	return &stats[stat_count++];
 }
 
+/* Where live draws spend their time, for one report window. */
+static struct {
+	uint64_t draws, map_ticks, flush_ticks, submit_ticks, drop_ticks, tiler_ns, fragment_ns;
+} live_split;
+
 static void
 report(uint64_t now)
 {
 	log_line("W window_us=%llu draw_us=%llu draws=%llu keys=%u overflow=%llu", to_us(now - window_start),
 	    to_us(ticks_in_draws), draws_total, stat_count, overflow);
+	if (live_split.draws) {
+		log_line("P draws=%llu map_us=%llu flush_us=%llu submit_us=%llu drop_us=%llu tiler_us=%llu fragment_us=%llu",
+		    live_split.draws, to_us(live_split.map_ticks), to_us(live_split.flush_ticks), to_us(live_split.submit_ticks),
+		    to_us(live_split.drop_ticks), live_split.tiler_ns / 1000, live_split.fragment_ns / 1000);
+		memset(&live_split, 0, sizeof(live_split));
+	}
 	for (unsigned i = 0; i < stat_count; i++) {
 		struct draw_stat *s = &stats[i];
 		if (s->ticks) {
@@ -264,13 +277,23 @@ read_shape(const uint16_t *indices, const uint32_t *vertices, struct quad_shape 
 }
 
 /* Clean and invalidate to memory: the GPU is not coherent with the CPU. */
-static void
-cache_flush(void *address, size_t bytes)
-{
-	uintptr_t line = (uintptr_t)address & ~(uintptr_t)63, end = (uintptr_t)address + bytes;
+/* A rectangle of a surface to clean and invalidate. */
+struct flush_rect {
+	const uint8_t *base;
+	size_t stride, row_bytes;
+	unsigned rows;
+};
 
-	for (; line < end; line += 64) {
-		__asm__ volatile ("dc civac, %0" : : "r"(line));
+static void
+cache_flush(const struct flush_rect *r)
+{
+	for (unsigned row = 0; row < r->rows; row++) {
+		uintptr_t begin = (uintptr_t)r->base + row * r->stride;
+		uintptr_t line = begin & ~(uintptr_t)63, end = begin + r->row_bytes;
+
+		for (; line < end; line += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r"(line));
+		}
 	}
 	__asm__ volatile ("dsb sy");
 }
@@ -292,7 +315,8 @@ struct translation {
 	int dest_bottom_up;
 	int x0, y0, x1, y1;             /* covered pixels, memory rows */
 	const uint8_t *texture;
-	size_t texture_bytes;
+	size_t texture_bytes, texture_source_stride;
+	int staged;                     /* sampled through stage_cpu, whose rows are aligned */
 	float opacity;
 };
 
@@ -301,7 +325,7 @@ struct source {
 	int surface;
 	uint64_t magnitude;
 	int64_t stride;
-	int width, height, linear;
+	int width, height, linear, staged;
 	float opacity;
 };
 
@@ -491,11 +515,18 @@ translate(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 			return R_TEXTURE;
 		}
 		if ((src.magnitude & 63) || src.magnitude < (uint64_t)src.width * 4) {
-			if (reject_samples[R_TEXTURE_STRIDE]++ < 4) {
+			static uint32_t formats_seen;
+			reject_samples[R_TEXTURE_STRIDE]++;
+			if (key->format < 32 && !(formats_seen & (1u << key->format))) {
+				formats_seen |= 1u << key->format;
 				log_line("S kind=%u fmt=%u %dx%d stride=%llu", key->kind, key->format, src.width, src.height,
 				    src.magnitude);
 			}
-			return R_TEXTURE_STRIDE;
+			src.staged = src.magnitude >= (uint64_t)src.width * 4 &&
+			    (((uint64_t)src.width * 4 + 63) & ~63ull) * (uint64_t)src.height <= STAGE_BYTES;
+			if (!src.staged) {
+				return R_TEXTURE_STRIDE;
+			}
 		}
 	}
 
@@ -549,9 +580,11 @@ translate(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 		}
 		t->texture = src.stride < 0 ? data + (int64_t)(src.height - 1) * src.stride : data;
 		t->texture_bytes = (size_t)src.magnitude * (size_t)src.height;
+		t->texture_source_stride = (size_t)src.magnitude;
+		t->staged = src.staged;
 		common.texture_width = (uint32_t)src.width;
 		common.texture_height = (uint32_t)src.height;
-		common.texture_stride = (uint32_t)src.magnitude;
+		common.texture_stride = src.staged ? (uint32_t)(((uint64_t)src.width * 4 + 63) & ~63ull) : (uint32_t)src.magnitude;
 		common.texture_format = B2L_FORMAT_BGRA8_UNORM;
 		common.linear = (uint32_t)src.linear;
 		t->opacity = a;
@@ -606,12 +639,39 @@ gpu_draw(struct translation *t, int live)
 		}
 		begin = mach_absolute_time();
 	}
-	size_t first = (size_t)by0 * t->stride, bytes = (size_t)(by1 - by0) * t->stride;
-	cache_flush(target + first, bytes);
+	struct flush_rect drawn = { target + (size_t)by0 * t->stride + (size_t)bx0 * 4, t->stride,
+		(size_t)(bx1 - bx0) * 4, (unsigned)(by1 - by0) };
+	uint64_t mapped = mach_absolute_time();
+	cache_flush(&drawn);
 
 	if (t->texture != NULL) {
-		cache_flush((void *)t->texture, t->texture_bytes);
-		uint64_t texture_va = map_range(t->texture, t->texture_bytes);
+		uint32_t tx0 = t->quads[0].texture_width, tx1 = 0, ty0 = t->quads[0].texture_height, ty1 = 0;
+		for (unsigned i = 0; i < t->quad_count; i++) {
+			const struct b2l_mali_quad *q = &t->quads[i];
+			if (q->shader_va != 0 && !(q->x0 == 0 && q->x1 == 0)) {
+				float u0, u1, v0, v1;
+				memcpy(&u0, &q->u0, 4);
+				memcpy(&u1, &q->u1, 4);
+				memcpy(&v0, &q->v0, 4);
+				memcpy(&v1, &q->v1, 4);
+				b2l_flush_span(u0, u1, q->texture_width, &tx0, &tx1);
+				b2l_flush_span(v0, v1, q->texture_height, &ty0, &ty1);
+			}
+		}
+		size_t stride = t->quads[0].texture_stride;
+		const uint8_t *sampled_base = t->staged ? stage_cpu : t->texture;
+		if (t->staged) {
+			for (uint32_t y = ty0; y < ty1; y++) {
+				memcpy(stage_cpu + y * stride + (size_t)tx0 * 4, t->texture + y * t->texture_source_stride + (size_t)tx0 * 4,
+				    (size_t)(tx1 - tx0) * 4);
+			}
+		}
+		if (tx1 > tx0 && ty1 > ty0) {
+			struct flush_rect sampled = { sampled_base + ty0 * stride + (size_t)tx0 * 4, stride,
+				(size_t)(tx1 - tx0) * 4, ty1 - ty0 };
+			cache_flush(&sampled);
+		}
+		uint64_t texture_va = t->staged ? stage_va : map_range(t->texture, t->texture_bytes);
 		if (texture_va == 0) {
 			return 0;
 		}
@@ -647,9 +707,20 @@ gpu_draw(struct translation *t, int live)
 		pass_type, B2L_MALI_PASS_BYTES(pass.draws), 0, 0, { 0 } };
 	uint64_t result[3] = { 0, 0, 0 };
 	uint32_t out_count = 3;
+	uint64_t submitted = mach_absolute_time();
 	kern_return_t kr = IOConnectCallMethod(connection, kB2LMaliSubmit, NULL, 0, &request, sizeof(request),
 	    result, &out_count, NULL, NULL);
-	cache_flush(target + first, bytes);     /* drop lines from before the GPU wrote */
+	uint64_t returned = mach_absolute_time();
+	cache_flush(&drawn);                    /* drop lines from before the GPU wrote */
+	if (live) {
+		live_split.draws++;
+		live_split.map_ticks += mapped - begin;
+		live_split.flush_ticks += submitted - mapped;
+		live_split.submit_ticks += returned - submitted;
+		live_split.drop_ticks += mach_absolute_time() - returned;
+		live_split.tiler_ns += result[1];
+		live_split.fragment_ns += result[2];
+	}
 	if (kr || result[0] != B2L_MALI_STATUS_DONE) {
 		log_line("gpu: submit kr=0x%x status=%llu live=%d, stopping", kr, result[0], live);
 		shadow_disabled = 1;
@@ -667,7 +738,9 @@ gpu_draw(struct translation *t, int live)
 static int
 live_kind(const struct draw_key *key)
 {
-	if (key->unit0 != UNIT_SURFACE || key->unit1 != 0 || key->image != IMAGE_IDENTITY) {
+	/* Image format 1: 23 of 23 exact in 0140, 8 of 8 in 0139. */
+	int source = key->unit0 == UNIT_SURFACE || ((key->unit0 == 1 || key->unit0 == 2) && key->format == 1);
+	if (!source || key->unit1 != 0 || key->image != IMAGE_IDENTITY) {
 		return 0;
 	}
 	if ((key->kind == 3 || key->kind == 1) && key->blend == BLEND_SOVER && (key->blend_on & 1)) {
@@ -767,7 +840,7 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 		if (why != R_NONE) {
 			rejects[why]++;
 			stat->why = why;
-		} else if (may_go_live && (t.x1 - t.x0) * (t.y1 - t.y0) >= LIVE_MIN_PIXELS && live_worthwhile(&key, &t)) {
+		} else if (may_go_live && !t.staged && (t.x1 - t.x0) * (t.y1 - t.y0) >= LIVE_MIN_PIXELS && live_worthwhile(&key, &t)) {
 			uint64_t ticks = gpu_draw(&t, 1);
 			if (ticks) {
 				/* What the CPU path does after drawing. */
@@ -891,7 +964,8 @@ prepare_shadow(void)
 	if (IOConnectCallMethod(connection, kB2LMaliInfo, NULL, 0, NULL, 0, info, &count, NULL, NULL) ||
 	    !create_buffer(B2L_MALI_PASS_BYTES(PASS_DRAWS), 0, &pass_va, &pass_type, &pass_cpu) ||
 	    !create_buffer(4096, B2L_MALI_BUFFER_CODE, &code_va, &type, &code) ||
-	    !create_buffer(SHADOW_BYTES, 0, &shadow_va, &type, &shadow_cpu)) {
+	    !create_buffer(SHADOW_BYTES, 0, &shadow_va, &type, &shadow_cpu) ||
+	    !create_buffer(STAGE_BYTES, 0, &stage_va, &type, &stage_cpu)) {
 		log_line("translator: buffers failed");
 		return 0;
 	}
@@ -900,7 +974,8 @@ prepare_shadow(void)
 	memcpy(code + SHADER_TEXTURED, b2l_mali_shader_textured, sizeof(b2l_mali_shader_textured));
 	memcpy(code + SHADER_SOLID, b2l_mali_shader_solid, sizeof(b2l_mali_shader_solid));
 	memcpy(code + SHADER_MODULATED, b2l_mali_shader_modulated, sizeof(b2l_mali_shader_modulated));
-	cache_flush(code, 4096);
+	struct flush_rect page = { code, 4096, 4096, 1 };
+	cache_flush(&page);
 	return 1;
 }
 

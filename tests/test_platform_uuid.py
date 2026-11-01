@@ -54,6 +54,12 @@ def main():
         assert 'SHA1' not in text and 'crypto' not in text
     # The id must stay out of the log.
     assert 'text)' not in source.split('IOPlatformUUID published')[1].split('\n')[0]
+    # configd's InterfaceNamer matches this class by name.
+    assert 'class IONetworkStack : public IOService' in source
+    # configd stops unless IOServiceOpen succeeds: 0141's stack had no user client.
+    assert 'class IONetworkStackUserClient : public IOUserClient' in source
+    assert source.index('kIOUserClientClassKey') < source.index('stack->registerService()')
+    assert source.index('stack->registerService()') > source.index('publishResource(kIOPlatformUUIDKey')
     print('platform uuid tests passed')
 
 
