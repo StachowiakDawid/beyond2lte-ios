@@ -116,6 +116,59 @@ __asm__(".text\n.p2align 2\n.globl _b2l_draw_original\n_b2l_draw_original:\n"
     " nop\n stp d9, d8, [sp, #-0x70]!\n stp x28, x27, [sp, #0x10]\n stp x26, x25, [sp, #0x20]\n"
     " adrp x16, _b2l_draw_resume@PAGE\n ldr x16, [x16, _b2l_draw_resume@PAGEOFF]\n br x16\n");
 
+/*
+ * Places where Core Animation reads or writes a destination on the CPU outside
+ * draw_elements. Each gets a hook that finishes any pending GPU batch and then
+ * runs the displaced entry instructions, as draw_elements does. Every argument
+ * register is saved around the call, since the signatures differ.
+ */
+#define PREHOOK(name, index, address, w1, w2, w3, i1, i2, i3) \
+	uint64_t b2l_resume_##name; \
+	void b2l_prehook_##name(void); \
+	static const uint32_t name##_WORDS[4] = { 0xd503201f, w1, w2, w3 }; \
+	__asm__(".text\n.p2align 2\n.globl _b2l_prehook_" #name "\n_b2l_prehook_" #name ":\n" \
+	    " stp x29, x30, [sp, #-0xe0]!\n stp x0, x1, [sp, #0x10]\n stp x2, x3, [sp, #0x20]\n" \
+	    " stp x4, x5, [sp, #0x30]\n stp x6, x7, [sp, #0x40]\n str x8, [sp, #0x50]\n" \
+	    " stp q0, q1, [sp, #0x60]\n stp q2, q3, [sp, #0x80]\n stp q4, q5, [sp, #0xa0]\n stp q6, q7, [sp, #0xc0]\n" \
+	    " mov x0, #" #index "\n bl _b2l_batch_commit_hook\n" \
+	    " ldp q6, q7, [sp, #0xc0]\n ldp q4, q5, [sp, #0xa0]\n ldp q2, q3, [sp, #0x80]\n ldp q0, q1, [sp, #0x60]\n" \
+	    " ldr x8, [sp, #0x50]\n ldp x6, x7, [sp, #0x40]\n ldp x4, x5, [sp, #0x30]\n ldp x2, x3, [sp, #0x20]\n" \
+	    " ldp x0, x1, [sp, #0x10]\n ldp x29, x30, [sp], #0xe0\n" \
+	    " nop\n " i1 "\n " i2 "\n " i3 "\n" \
+	    " adrp x16, _b2l_resume_" #name "@PAGE\n ldr x16, [x16, _b2l_resume_" #name "@PAGEOFF]\n br x16\n");
+
+void b2l_batch_commit_hook(uint64_t which);
+PREHOOK(clear_region, 5, 0x18410c740ull, 0xd10283ff, 0x6d0423e9, 0xa90567fa,
+    "sub sp, sp, #0xa0", "stp d9, d8, [sp, #0x40]", "stp x26, x25, [sp, #0x50]")
+PREHOOK(blur_surface, 6, 0x18410c974ull, 0xd10503ff, 0x6d0d2beb, 0x6d0e23e9,
+    "sub sp, sp, #0x140", "stp d11, d10, [sp, #0xd0]", "stp d9, d8, [sp, #0xe0]")
+PREHOOK(copy_destination, 7, 0x18410d0e4ull, 0xa9bb67fa, 0xa9015ff8, 0xa90257f6,
+    "stp x26, x25, [sp, #-0x50]!", "stp x24, x23, [sp, #0x10]", "stp x22, x21, [sp, #0x20]")
+PREHOOK(make_buffer_current, 8, 0x18410c420ull, 0xd10243ff, 0xa9055ff8, 0xa90657f6,
+    "sub sp, sp, #0x90", "stp x24, x23, [sp, #0x50]", "stp x22, x21, [sp, #0x60]")
+PREHOOK(finalize_surface, 9, 0x18410cf60ull, 0xa9be4ff4, 0xa9017bfd, 0x910043fd,
+    "stp x20, x19, [sp, #-0x20]!", "stp x29, x30, [sp, #0x10]", "add x29, sp, #0x10")
+PREHOOK(swap_begin, 10, 0x183f291fcull, 0xa9be4ff4, 0xa9017bfd, 0x910043fd,
+    "stp x20, x19, [sp, #-0x20]!", "stp x29, x30, [sp, #0x10]", "add x29, sp, #0x10")
+
+static const struct {
+	const char *name;
+	uint64_t address;
+	const uint32_t *words;
+	void (*stub)(void);
+	uint64_t *resume;
+} prehooks[] = {
+	{ "clear_region", 0x18410c740ull, clear_region_WORDS, b2l_prehook_clear_region, &b2l_resume_clear_region },
+	{ "blur_surface", 0x18410c974ull, blur_surface_WORDS, b2l_prehook_blur_surface, &b2l_resume_blur_surface },
+	{ "copy_destination", 0x18410d0e4ull, copy_destination_WORDS, b2l_prehook_copy_destination,
+	    &b2l_resume_copy_destination },
+	{ "make_buffer_current", 0x18410c420ull, make_buffer_current_WORDS, b2l_prehook_make_buffer_current,
+	    &b2l_resume_make_buffer_current },
+	{ "finalize_surface", 0x18410cf60ull, finalize_surface_WORDS, b2l_prehook_finalize_surface,
+	    &b2l_resume_finalize_surface },
+	{ "swap_begin", 0x183f291fcull, swap_begin_WORDS, b2l_prehook_swap_begin, &b2l_resume_swap_begin },
+};
+
 static io_connect_t connection;
 
 static void
@@ -151,7 +204,7 @@ struct draw_stat {
 };
 static struct draw_stat stats[MAX_KEYS];
 static unsigned stat_count, compared_in_window;
-static uint64_t window_start, ticks_in_draws, draws_total, overflow;
+static uint64_t window_start, ticks_in_draws, draws_total, overflow, thread_busy_us;
 static mach_timebase_info_data_t timebase;
 static int shadow_ready, shadow_disabled, shadow_busy;
 static uint8_t *pass_cpu, *shadow_cpu, *stage_cpu;
@@ -187,18 +240,33 @@ stat_for(const struct draw_key *key)
 
 /* Where live draws spend their time, for one report window. */
 static struct {
-	uint64_t draws, map_ticks, flush_ticks, submit_ticks, drop_ticks, tiler_ns, fragment_ns;
+	uint64_t draws, map_ticks, flush_ticks, submit_ticks, drop_ticks, tiler_ns, fragment_ns, commits, commit_ticks;
+	/* Why batches ended: cpu draw, other dest, full, self-sample, texture failed, then one per pre-hook. */
+	uint64_t why[12];
 } live_split;
 
 static void
 report(uint64_t now)
 {
-	log_line("W window_us=%llu draw_us=%llu draws=%llu keys=%u overflow=%llu", to_us(now - window_start),
-	    to_us(ticks_in_draws), draws_total, stat_count, overflow);
+	/* This thread's CPU time: the draws' share of what the renderer actually did. */
+	thread_basic_info_data_t info;
+	mach_msg_type_number_t info_count = THREAD_BASIC_INFO_COUNT;
+	uint64_t busy_us = 0;
+	if (thread_info(mach_thread_self(), THREAD_BASIC_INFO, (thread_info_t)&info, &info_count) == KERN_SUCCESS) {
+		busy_us = (uint64_t)info.user_time.seconds * 1000000 + info.user_time.microseconds +
+		    (uint64_t)info.system_time.seconds * 1000000 + info.system_time.microseconds;
+	}
+	log_line("W window_us=%llu draw_us=%llu busy_us=%llu draws=%llu keys=%u overflow=%llu", to_us(now - window_start),
+	    to_us(ticks_in_draws), busy_us - thread_busy_us, draws_total, stat_count, overflow);
+	thread_busy_us = busy_us;
 	if (live_split.draws) {
-		log_line("P draws=%llu map_us=%llu flush_us=%llu submit_us=%llu drop_us=%llu tiler_us=%llu fragment_us=%llu",
-		    live_split.draws, to_us(live_split.map_ticks), to_us(live_split.flush_ticks), to_us(live_split.submit_ticks),
-		    to_us(live_split.drop_ticks), live_split.tiler_ns / 1000, live_split.fragment_ns / 1000);
+		log_line("P draws=%llu commits=%llu commit_us=%llu map_us=%llu flush_us=%llu submit_us=%llu drop_us=%llu tiler_us=%llu fragment_us=%llu",
+		    live_split.draws, live_split.commits, to_us(live_split.commit_ticks), to_us(live_split.map_ticks),
+		    to_us(live_split.flush_ticks), to_us(live_split.submit_ticks), to_us(live_split.drop_ticks),
+		    live_split.tiler_ns / 1000, live_split.fragment_ns / 1000);
+		log_line("B cpu=%llu dest=%llu full=%llu self=%llu tex=%llu clear=%llu blur=%llu copy=%llu current=%llu finalize=%llu swap=%llu",
+		    live_split.why[0], live_split.why[1], live_split.why[2], live_split.why[3], live_split.why[4], live_split.why[5],
+		    live_split.why[6], live_split.why[7], live_split.why[8], live_split.why[9], live_split.why[10]);
 		memset(&live_split, 0, sizeof(live_split));
 	}
 	for (unsigned i = 0; i < stat_count; i++) {
@@ -322,7 +390,7 @@ struct translation {
 	size_t texture_bytes, texture_source_stride;
 	int staged;                     /* sampled through stage_cpu, whose rows are aligned */
 	unsigned texel_bytes;
-	int tinted;                     /* a colour, or a one-channel mask: not proven live yet */
+	int tinted;                     /* a colour, or a one-channel mask */
 	float opacity;
 };
 
@@ -630,37 +698,10 @@ translate(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 	return R_NONE;
 }
 
-/*
- * Run the draw on the GPU, into the real destination or the shadow copy of it.
- * A tile starts empty, so a first draw brings back what the quads do not cover.
- * Returns the time taken, or 0 if nothing was drawn.
- */
-static uint64_t
-gpu_draw(struct translation *t, int live)
+/* Stage, clean and map the texture a translation samples; 0 if it cannot be. */
+static int
+prepare_texture(struct translation *t)
 {
-	int bx0 = t->x0 & ~15, by0 = t->y0 & ~15;
-	int bx1 = (t->x1 + 15) & ~15, by1 = (t->y1 + 15) & ~15;
-	bx1 = bx1 > (int)t->width ? (int)t->width : bx1;
-	by1 = by1 > (int)t->height ? (int)t->height : by1;
-	uint64_t begin = mach_absolute_time();
-	uint8_t *target = live ? (uint8_t *)(uintptr_t)t->dest : shadow_cpu;
-	uint64_t target_va = live ? map_range(t->dest, (uint64_t)t->stride * t->height) : shadow_va;
-
-	if (target_va == 0 || (target_va & 63)) {
-		return 0;
-	}
-	if (!live) {
-		for (int y = by0; y < by1; y++) {
-			memcpy(shadow_cpu + (size_t)y * t->stride + (size_t)bx0 * 4,
-			    t->dest + (size_t)y * t->stride + (size_t)bx0 * 4, (size_t)(bx1 - bx0) * 4);
-		}
-		begin = mach_absolute_time();
-	}
-	struct flush_rect drawn = { target + (size_t)by0 * t->stride + (size_t)bx0 * 4, t->stride,
-		(size_t)(bx1 - bx0) * 4, (unsigned)(by1 - by0) };
-	uint64_t mapped = mach_absolute_time();
-	cache_flush(&drawn);
-
 	if (t->texture != NULL) {
 		uint32_t tx0 = t->quads[0].texture_width, tx1 = 0, ty0 = t->quads[0].texture_height, ty1 = 0;
 		for (unsigned i = 0; i < t->quad_count; i++) {
@@ -696,6 +737,206 @@ gpu_draw(struct translation *t, int live)
 		for (unsigned i = 0; i < t->quad_count; i++) {
 			t->quads[i].texture_va = texture_va;
 		}
+	}
+	return 1;
+}
+
+/*
+ * Consecutive live draws into one destination form a batch: one GPU pass, one
+ * clean of the destination before and one invalidate after, instead of a pass per
+ * draw. The batch ends when a draw cannot join it, when anything else touches a
+ * destination on the CPU (the pre-hooks above), or when the pass is full. While a
+ * batch is open, nothing on the CPU reads or writes its destination or any
+ * surface it samples: every path that could does so through draw_elements or a
+ * hooked function, and both commit first.
+ */
+static struct {
+	int active;
+	const uint8_t *dest;
+	uint8_t *target;
+	uint64_t target_va;
+	uint32_t stride, width, height;
+	int bx0, by0, bx1, by1;
+	struct b2l_mali_pass pass;
+	const void *textures[PASS_DRAWS];
+	unsigned texture_count, draws;
+} batch;
+
+static void
+batch_keep(void)
+{
+	float u0 = (float)batch.bx0 / (float)batch.width, u1 = (float)batch.bx1 / (float)batch.width;
+	float v0 = (float)batch.by0 / (float)batch.height, v1 = (float)batch.by1 / (float)batch.height;
+	struct b2l_mali_quad keep = {
+		b2l_int_float((uint32_t)batch.bx0), b2l_int_float((uint32_t)batch.by0), b2l_int_float((uint32_t)batch.bx1),
+		b2l_int_float((uint32_t)batch.by1), 0, 0, 0, 0, { 0, 0, 0, 0 }, code_va + SHADER_TEXTURED, batch.target_va,
+		batch.width, batch.height, batch.stride, B2L_FORMAT_BGRA8_UNORM, B2L_EQ_COPY, 0, 1, 0, 0,
+	};
+	memcpy(&keep.u0, &u0, 4);
+	memcpy(&keep.u1, &u1, 4);
+	memcpy(&keep.v0, &v0, 4);
+	memcpy(&keep.v1, &v1, 4);
+	/* Slot 0 again, with the final bounds; then the link to slot 1 it zeroed. */
+	unsigned draws = batch.pass.draws;
+	batch.pass.draws = 0;
+	b2l_mali_pass_add(&batch.pass, &keep);
+	batch.pass.draws = draws;
+	if (draws > 1) {
+		b2l_put64((uint32_t *)(batch.pass.cpu + B2L_MALI_PASS_DRAWS) + 6, batch.pass.va + B2L_MALI_PASS_DRAWS + B2L_MALI_DRAW_BYTES);
+	}
+}
+
+/* Run the open batch, if any, noting why. Caller holds shadow_busy. */
+static void
+batch_commit_why(unsigned why)
+{
+	if (!batch.active) {
+		return;
+	}
+	live_split.why[why < 12 ? why : 11]++;
+	uint64_t begin = mach_absolute_time();
+	batch.active = 0;
+	batch_keep();
+	b2l_mali_pass_bounds(&batch.pass, (uint32_t)batch.bx0, (uint32_t)batch.by0, (uint32_t)batch.bx1, (uint32_t)batch.by1);
+	struct flush_rect drawn = { batch.target + (size_t)batch.by0 * batch.stride + (size_t)batch.bx0 * 4, batch.stride,
+		(size_t)(batch.bx1 - batch.bx0) * 4, (unsigned)(batch.by1 - batch.by0) };
+	uint64_t mapped = mach_absolute_time();
+	cache_flush(&drawn);
+	struct b2l_mali_submit request = { batch.pass.va + B2L_MALI_PASS_DRAWS, batch.pass.va + B2L_MALI_PASS_FRAGMENT,
+		pass_type, B2L_MALI_PASS_BYTES(batch.pass.draws), 0, 0, { 0 } };
+	uint64_t result[3] = { 0, 0, 0 };
+	uint32_t out_count = 3;
+	uint64_t submitted = mach_absolute_time();
+	kern_return_t kr = IOConnectCallMethod(connection, kB2LMaliSubmit, NULL, 0, &request, sizeof(request),
+	    result, &out_count, NULL, NULL);
+	uint64_t returned = mach_absolute_time();
+	cache_flush(&drawn);
+	uint64_t end = mach_absolute_time();
+	live_split.map_ticks += mapped - begin;
+	live_split.flush_ticks += submitted - mapped;
+	live_split.submit_ticks += returned - submitted;
+	live_split.drop_ticks += end - returned;
+	live_split.tiler_ns += result[1];
+	live_split.fragment_ns += result[2];
+	live_split.commits++;
+	live_split.commit_ticks += end - begin;
+	ticks_in_draws += end - begin;
+	if (kr || result[0] != B2L_MALI_STATUS_DONE) {
+		log_line("gpu: batch kr=0x%x status=%llu draws=%u, stopping", kr, result[0], batch.draws);
+		shadow_disabled = 1;
+	}
+}
+
+#define batch_commit() batch_commit_why(0)
+
+/* From the pre-hooks: any thread, no lock held. */
+void
+b2l_batch_commit_hook(uint64_t which)
+{
+	if (!__atomic_load_n(&batch.active, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	while (__atomic_exchange_n(&shadow_busy, 1, __ATOMIC_ACQUIRE)) {
+	}
+	batch_commit_why((unsigned)which);
+	__atomic_store_n(&shadow_busy, 0, __ATOMIC_RELEASE);
+}
+
+/* Add a live draw to the batch, opening one for its destination if needed. */
+static uint64_t
+batch_append(struct translation *t)
+{
+	int bx0 = t->x0 & ~15, by0 = t->y0 & ~15;
+	int bx1 = (t->x1 + 15) & ~15, by1 = (t->y1 + 15) & ~15;
+	bx1 = bx1 > (int)t->width ? (int)t->width : bx1;
+	by1 = by1 > (int)t->height ? (int)t->height : by1;
+	uint64_t begin = mach_absolute_time();
+
+	if (batch.active) {
+		if (batch.dest != t->dest || batch.stride != t->stride || batch.width != t->width || batch.height != t->height) {
+			batch_commit_why(1);
+		} else if (batch.pass.draws + t->quad_count >= PASS_DRAWS) {
+			batch_commit_why(2);
+		} else if (t->texture == t->dest) {
+			batch_commit_why(3);
+		}
+	}
+	if (!batch.active) {
+		uint64_t target_va = map_range(t->dest, (uint64_t)t->stride * t->height);
+		if (target_va == 0 || (target_va & 63)) {
+			return 0;
+		}
+		batch.dest = t->dest;
+		batch.target = (uint8_t *)(uintptr_t)t->dest;
+		batch.target_va = target_va;
+		batch.stride = t->stride;
+		batch.width = t->width;
+		batch.height = t->height;
+		batch.bx0 = bx0; batch.by0 = by0; batch.bx1 = bx1; batch.by1 = by1;
+		batch.texture_count = 0;
+		batch.draws = 0;
+		struct b2l_mali_target rt = { target_va, t->width, t->height, t->stride, 0, B2L_RT_BGRA, heap_va, heap_bytes };
+		b2l_mali_pass_begin(&batch.pass, pass_cpu, pass_va, &rt);
+		struct b2l_mali_quad placeholder;
+		memset(&placeholder, 0, sizeof(placeholder));
+		placeholder.shader_va = code_va + SHADER_TEXTURED;
+		b2l_mali_pass_add(&batch.pass, &placeholder);
+		batch.active = 1;
+	}
+	if (!prepare_texture(t)) {
+		batch_commit_why(4);
+		return 0;
+	}
+	batch.bx0 = bx0 < batch.bx0 ? bx0 : batch.bx0;
+	batch.by0 = by0 < batch.by0 ? by0 : batch.by0;
+	batch.bx1 = bx1 > batch.bx1 ? bx1 : batch.bx1;
+	batch.by1 = by1 > batch.by1 ? by1 : batch.by1;
+	for (unsigned i = 0; i < t->quad_count; i++) {
+		if (t->quads[i].shader_va != 0 && !(t->quads[i].x0 == 0 && t->quads[i].x1 == 0)) {
+			b2l_mali_pass_add(&batch.pass, &t->quads[i]);
+		}
+	}
+	if (t->texture != NULL && batch.texture_count < PASS_DRAWS) {
+		batch.textures[batch.texture_count++] = t->texture;
+	}
+	batch.draws++;
+	live_split.draws++;
+	return mach_absolute_time() - begin + 1;
+}
+
+/*
+ * Run the draw on the GPU, into the real destination or the shadow copy of it.
+ * A tile starts empty, so a first draw brings back what the quads do not cover.
+ * Returns the time taken, or 0 if nothing was drawn.
+ */
+static uint64_t
+gpu_draw(struct translation *t, int live)
+{
+	int bx0 = t->x0 & ~15, by0 = t->y0 & ~15;
+	int bx1 = (t->x1 + 15) & ~15, by1 = (t->y1 + 15) & ~15;
+	bx1 = bx1 > (int)t->width ? (int)t->width : bx1;
+	by1 = by1 > (int)t->height ? (int)t->height : by1;
+	uint64_t begin = mach_absolute_time();
+	uint8_t *target = live ? (uint8_t *)(uintptr_t)t->dest : shadow_cpu;
+	uint64_t target_va = live ? map_range(t->dest, (uint64_t)t->stride * t->height) : shadow_va;
+
+	if (target_va == 0 || (target_va & 63)) {
+		return 0;
+	}
+	if (!live) {
+		for (int y = by0; y < by1; y++) {
+			memcpy(shadow_cpu + (size_t)y * t->stride + (size_t)bx0 * 4,
+			    t->dest + (size_t)y * t->stride + (size_t)bx0 * 4, (size_t)(bx1 - bx0) * 4);
+		}
+		begin = mach_absolute_time();
+	}
+	struct flush_rect drawn = { target + (size_t)by0 * t->stride + (size_t)bx0 * 4, t->stride,
+		(size_t)(bx1 - bx0) * 4, (unsigned)(by1 - by0) };
+	uint64_t mapped = mach_absolute_time();
+	cache_flush(&drawn);
+
+	if (!prepare_texture(t)) {
+		return 0;
 	}
 
 	struct b2l_mali_target rt = { target_va, t->width, t->height, t->stride, 0, B2L_RT_BGRA, heap_va, heap_bytes };
@@ -756,9 +997,9 @@ gpu_draw(struct translation *t, int live)
 static int
 live_kind(const struct draw_key *key)
 {
-	/* Image formats 1, 11 and 13: no wrong pixels in 0143, 183 draws compared. */
+	/* Image formats 1, 11, 13: no wrong pixels in 0143. Format 9 masks: 65 of 66 in 0144. */
 	int image = (key->unit0 == 1 || key->unit0 == 2) && (key->format == 1 || key->format == IMAGE_FORMAT_RGBA8 ||
-	    key->format == IMAGE_FORMAT_RGBA16F);
+	    key->format == IMAGE_FORMAT_RGBA16F || key->format == IMAGE_FORMAT_MASK);
 	int source = key->unit0 == UNIT_SURFACE || image;
 	if (!source || key->unit1 != 0 || key->image != IMAGE_IDENTITY) {
 		return 0;
@@ -766,7 +1007,11 @@ live_kind(const struct draw_key *key)
 	if ((key->kind == 3 || key->kind == 1) && key->blend == BLEND_SOVER && (key->blend_on & 1)) {
 		return 1;
 	}
-	return key->kind == 1 && key->blend == BLEND_COPY && !(key->blend_on & 1);
+	if (key->kind == 1 && key->blend == BLEND_COPY && !(key->blend_on & 1)) {
+		return 1;
+	}
+	/* Masks arrive with the Sover blend and other flag bits set. */
+	return key->format == IMAGE_FORMAT_MASK && key->blend == BLEND_SOVER && (key->blend_on & 1);
 }
 
 /* A plain copy is only worth the GPU when it has to filter. */
@@ -853,15 +1098,34 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 	/* Render threads share the pass and shadow buffers: one at a time. */
 	int want_shadow = stat != NULL && compared_in_window < SHADOW_PER_WINDOW && stat->compared < SHADOW_PER_KEY;
 	int may_go_live = stat != NULL && live_kind(&key) && stat->compared >= LIVE_SAMPLES && stat->wrong == 0;
-	if (shadow_ready && !shadow_disabled && (want_shadow || may_go_live) &&
-	    !__atomic_exchange_n(&shadow_busy, 1, __ATOMIC_ACQUIRE)) {
+	int pending = __atomic_load_n(&batch.active, __ATOMIC_ACQUIRE);
+	if (pending) {
+		/* A batch is open: this draw either joins it or ends it before it touches memory. */
+		while (__atomic_exchange_n(&shadow_busy, 1, __ATOMIC_ACQUIRE)) {
+		}
+		owner = 1;
+	}
+	/*
+	 * In 0147, 445 of 523 batches ended at a CPU draw between two GPU draws. A
+	 * draw that is exact on the GPU but cheaper on the CPU alone, a solid fill or a
+	 * small draw, still joins an open batch to its own destination: inside a pass
+	 * it costs no flush, and it keeps the batch alive.
+	 */
+	int may_join = pending && stat != NULL && stat->compared >= LIVE_SAMPLES && stat->wrong == 0 &&
+	    (live_kind(&key) || (key.kind == 0 && key.unit0 == 0 && key.blend == BLEND_SOVER));
+	if (shadow_ready && !shadow_disabled && (want_shadow || may_go_live || may_join) &&
+	    (owner || !__atomic_exchange_n(&shadow_busy, 1, __ATOMIC_ACQUIRE))) {
 		owner = 1;
 		enum reject why = translate(ctx, mode, count, indices, vertices, clip, &key, &t);
+		int joins = may_join && why == R_NONE && batch.active && batch.dest == t.dest && batch.stride == t.stride &&
+		    batch.width == t.width && batch.height == t.height && t.texture != t.dest &&
+		    batch.pass.draws + t.quad_count < PASS_DRAWS;
 		if (why != R_NONE) {
 			rejects[why]++;
 			stat->why = why;
-		} else if (may_go_live && !t.tinted && (t.x1 - t.x0) * (t.y1 - t.y0) >= LIVE_MIN_PIXELS && live_worthwhile(&key, &t)) {
-			uint64_t ticks = gpu_draw(&t, 1);
+			batch_commit();
+		} else if (joins || (may_go_live && (t.x1 - t.x0) * (t.y1 - t.y0) >= LIVE_MIN_PIXELS && live_worthwhile(&key, &t))) {
+			uint64_t ticks = batch_append(&t);
 			if (ticks) {
 				/* What the CPU path does after drawing. */
 				marked_destination_function(ctx);
@@ -878,10 +1142,16 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 				return;
 			}
 			stat->live_failed++;
-		} else if (want_shadow) {
-			sampled = 1;
-			gpu = gpu_draw(&t, 0);
+			batch_commit();
+		} else {
+			batch_commit();
+			if (want_shadow) {
+				sampled = 1;
+				gpu = gpu_draw(&t, 0);
+			}
 		}
+	} else if (owner) {
+		batch_commit();
 	}
 	uint64_t begin = mach_absolute_time();
 	b2l_draw_original(ctx, mode, count, indices, vertices, a, b, clip);
@@ -953,7 +1223,31 @@ install_hook(void)
 	sys_icache_invalidate(target, sizeof(patch));
 	kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
 	log_line("hook: installed at %p, protect=%d", target, kr);
-	return kr == 0;
+	if (kr) {
+		return 0;
+	}
+	for (unsigned i = 0; i < sizeof(prehooks) / sizeof(prehooks[0]); i++) {
+		uint32_t *at = (uint32_t *)(prehooks[i].address + slide);
+		if (memcmp(at, prehooks[i].words, 16)) {
+			log_line("hook: %s entry bytes differ %08x %08x", prehooks[i].name, at[0], at[1]);
+			return 0;
+		}
+	}
+	for (unsigned i = 0; i < sizeof(prehooks) / sizeof(prehooks[0]); i++) {
+		uint32_t *at = (uint32_t *)(prehooks[i].address + slide);
+		vm_address_t p = (vm_address_t)at & ~(vm_address_t)(vm_page_size - 1);
+		*prehooks[i].resume = (uint64_t)(at + 4);
+		if (vm_protect(mach_task_self(), p, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY)) {
+			log_line("hook: %s not writable", prehooks[i].name);
+			return 0;
+		}
+		struct { uint32_t ldr, br; uint64_t address; } pre = { 0x58000050, 0xd61f0200, (uint64_t)prehooks[i].stub };
+		memcpy(at, &pre, sizeof(pre));
+		sys_icache_invalidate(at, sizeof(pre));
+		vm_protect(mach_task_self(), p, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	}
+	log_line("hook: %u pre-hooks installed", (unsigned)(sizeof(prehooks) / sizeof(prehooks[0])));
+	return 1;
 }
 
 static int

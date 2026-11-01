@@ -84,6 +84,10 @@ int main(void) {
 
  rate[B2L_DVFS_G3D] = 156000;
  assert(b2l_acpm_tmu_init(&io, &t));
+ assert(b2l_acpm_big_step(0, 75, 76, 4, 4) == 0 && b2l_acpm_big_step(0, 76, 76, 4, 4) == 1);
+ assert(b2l_acpm_big_step(0, 80, 76, 4, 4) == 2 && b2l_acpm_big_step(0, 99, 76, 4, 4) == 3);
+ assert(b2l_acpm_big_step(2, 78, 76, 4, 4) == 2 && b2l_acpm_big_step(2, 77, 76, 4, 4) == 1);
+ assert(b2l_acpm_big_step(3, 60, 76, 4, 4) == 0 && b2l_acpm_big_step(1, 73, 76, 4, 4) == 0);
  struct b2l_acpm_load load = { 0, 0 };
  b2l_acpm_load_step(&load, 14, 15, 8, 3); assert(!load.boosted);
  b2l_acpm_load_step(&load, 15, 15, 8, 3); assert(load.boosted);

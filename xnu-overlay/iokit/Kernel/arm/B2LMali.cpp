@@ -53,13 +53,16 @@ extern "C" void b2l_cpu_load_sample(uint64_t *busy, uint64_t *idle);
  */
 static const struct {
 	const char *name;
-	uint32_t domain, boot_khz, boost_khz, warm_khz;
+	uint32_t domain, boot_khz, boost_khz;
 } b2l_cpu_clusters[] = {
-	{ "cl0", B2L_DVFS_CPUCL0, 1053000, 1586000, 1586000 },
-	{ "cl1", B2L_DVFS_CPUCL1, 1222000, 2002000, 2002000 },
-	{ "cl2", B2L_DVFS_CPUCL2, 1378000, 2080000, 1560000 },
+	{ "cl0", B2L_DVFS_CPUCL0, 1053000, 1586000 },
+	{ "cl1", B2L_DVFS_CPUCL1, 1222000, 2002000 },
+	{ "cl2", B2L_DVFS_CPUCL2, 1378000, 2080000 },
 };
 #define B2L_CPU_CLUSTERS (sizeof(b2l_cpu_clusters) / sizeof(b2l_cpu_clusters[0]))
+/* The big cluster under load, fastest first; the last is its boot rate. */
+static const uint32_t b2l_big_steps[] = { 2080000, 1820000, 1560000, 1378000 };
+#define B2L_BIG_STEPS (sizeof(b2l_big_steps) / sizeof(b2l_big_steps[0]))
 
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" int proc_selfpid(void);
@@ -124,8 +127,10 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_GPU_MAX_KHZ        702000
 #define B2L_GPU_HOT_C          85
 #define B2L_GPU_COOL_C         75
-#define B2L_CPU_BIG_HOT_C      80              /* the big sensor: only that cluster steps down */
-#define B2L_CPU_BIG_COOL_C     70
+#define B2L_CPU_BIG_FIRST_C    76              /* the big sensor: that cluster steps down from here */
+#define B2L_CPU_BIG_PER_C      4               /* and one more step for each of these */
+#define B2L_MIF_KHZ            2093000         /* Android's boot memory clock; 0 leaves it */
+#define B2L_MIF_TEST_BYTES     (8u << 20)
 #define B2L_CPU_ALL_HOT_C      88              /* any sensor: every cluster goes to its boot rate */
 #define B2L_CPU_ALL_COOL_C     78
 #define B2L_CPU_POLL_MS        250
@@ -196,6 +201,7 @@ class B2LMali : public IOService {
 	void readTemperatures(int *temperatures);
 	void busyDump(unsigned second);
 	bool setCluster(unsigned cluster, uint32_t khz);
+	void memoryClock();
 	void clusterBoost();
 	void acpmStart();
 	void gpuClock(bool busy);
@@ -752,6 +758,56 @@ B2LMali::setCluster(unsigned cluster, uint32_t khz)
 	return answered;
 }
 
+/* Bytes per second a kernel memcpy reaches; the best of three 8 MiB runs. */
+static uint64_t
+b2l_copy_bandwidth(void *from, void *to)
+{
+	uint64_t best = 0;
+
+	for (int run = 0; run < 3; run++) {
+		uint64_t began = mach_absolute_time();
+		memcpy(to, from, B2L_MIF_TEST_BYTES);
+		uint64_t ns = 0;
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+		uint64_t rate = ns ? (uint64_t)B2L_MIF_TEST_BYTES * 2 * 1000000000ull / ns : 0;
+		best = rate > best ? rate : best;
+	}
+	return best;
+}
+
+/*
+ * The memory clock: measure a copy, ask ACPM for Android's boot rate, measure
+ * again. The two figures say whether the request did anything, since a rate read
+ * returns 0. The display copy ran at about 5 GB/s in 0144, far under LPDDR4X.
+ */
+void
+B2LMali::memoryClock()
+{
+	int khz = B2L_MIF_KHZ;
+	PE_parse_boot_argn("b2l_mif_khz", &khz, sizeof(khz));
+	if (khz <= 0) {
+		b2l_diag_record("B2L ACPM: memory clock left alone\n");
+		return;
+	}
+	void *from = IOMalloc(B2L_MIF_TEST_BYTES), *to = IOMalloc(B2L_MIF_TEST_BYTES);
+	if (from == NULL || to == NULL) {
+		if (from) IOFree(from, B2L_MIF_TEST_BYTES);
+		if (to) IOFree(to, B2L_MIF_TEST_BYTES);
+		return;
+	}
+	memset(from, 0x5a, B2L_MIF_TEST_BYTES);
+	uint64_t before = b2l_copy_bandwidth(from, to);
+	b2l_diag_record("B2L ACPM: copy %llu MB/s before, asking mif %d kHz\n", before >> 20, khz);
+	IOSleep(B2L_GPU_LOG_DRAIN_MS);
+	IOLockLock(runtimeLock);
+	int answered = acpmReady && b2l_acpm_set_rate(&acpm, &acpmDvfs, B2L_DVFS_MIF, (uint32_t)khz);
+	IOLockUnlock(runtimeLock);
+	uint64_t after = b2l_copy_bandwidth(from, to);
+	b2l_diag_record("B2L ACPM: mif reply=%d, copy %llu MB/s after\n", answered, after >> 20);
+	IOFree(from, B2L_MIF_TEST_BYTES);
+	IOFree(to, B2L_MIF_TEST_BYTES);
+}
+
 /*
  * The CPUs run fast only under load: left high, an idle phone reached 80 C in 0139.
  * Under load the big cores heat far faster than the rest, so they alone step down
@@ -771,8 +827,10 @@ B2LMali::clusterBoost()
 		b2l_diag_record("B2L ACPM: CPU clocks left alone, no sensors\n");
 		return;
 	}
+	memoryClock();
 	struct b2l_acpm_load load = { 0, 0 };
-	int bigWarm = 0, holding = 0;
+	unsigned bigStep = 0;
+	int holding = 0;
 	bool measured = false;
 	unsigned dumped = 0, changes = 0, reads = 0, percent = 0;
 	uint32_t rates[B2L_CPU_CLUSTERS];
@@ -813,7 +871,7 @@ B2LMali::clusterBoost()
 				}
 				return;
 			}
-			bigWarm = b2l_acpm_thermal_hold(bigWarm, temperatures[B2L_TMU_BIG], B2L_CPU_BIG_HOT_C, B2L_CPU_BIG_COOL_C);
+			bigStep = b2l_acpm_big_step(bigStep, temperatures[B2L_TMU_BIG], B2L_CPU_BIG_FIRST_C, B2L_CPU_BIG_PER_C, B2L_BIG_STEPS);
 			int hold = b2l_acpm_thermal_hold(holding, hottest, B2L_CPU_ALL_HOT_C, B2L_CPU_ALL_COOL_C);
 			if (hold != holding) {
 				b2l_diag_record("B2L ACPM: hottest %d C, CPUs %s\n", hottest, hold ? "held at boot clocks" : "released");
@@ -829,7 +887,7 @@ B2LMali::clusterBoost()
 		for (unsigned i = 0; i < B2L_CPU_CLUSTERS; i++) {
 			uint32_t want = b2l_cpu_clusters[i].boot_khz;
 			if (enabled && load.boosted && !holding) {
-				want = bigWarm ? b2l_cpu_clusters[i].warm_khz : b2l_cpu_clusters[i].boost_khz;
+				want = i == B2L_CPU_CLUSTERS - 1 ? b2l_big_steps[bigStep] : b2l_cpu_clusters[i].boost_khz;
 			}
 			if (want != rates[i]) {
 				if (!setCluster(i, want)) {

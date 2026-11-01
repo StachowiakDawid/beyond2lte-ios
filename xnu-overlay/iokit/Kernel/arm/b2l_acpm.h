@@ -209,6 +209,28 @@ b2l_acpm_load_step(struct b2l_acpm_load *load, uint32_t percent, uint32_t up, ui
 	}
 }
 
+/*
+ * The big cluster's rate for its temperature: one step per 4 C from 76 C, and a
+ * step back up only 3 C below the mark that took it down, so it does not flap.
+ * Returns the index into a table that starts with the fastest rate.
+ */
+static inline unsigned
+b2l_acpm_big_step(unsigned current, int temp, int first_c, int per_c, unsigned steps)
+{
+	unsigned down = 0;
+
+	while (down + 1 < steps && temp >= first_c + (int)down * per_c) {
+		down++;
+	}
+	if (down > current) {
+		return down;
+	}
+	while (current > 0 && temp <= first_c + (int)(current - 1) * per_c - 3) {
+		current--;
+	}
+	return current;
+}
+
 /* Android's first TMU request: the firmware starts its sensors. 1 on a reply. */
 static inline int
 b2l_acpm_tmu_init(const struct b2l_acpm_io *io, struct b2l_acpm_channel *tmu)
