@@ -47,6 +47,9 @@
 #define B2L_FUNC_ALWAYS         7u
 #define B2L_FORMAT_RGBA8_UNORM  (187u << 12)
 #define B2L_FORMAT_BGRA8_UNORM  ((187u << 12) | 4u)
+#define B2L_FORMAT_RGBA8_UNORM  (187u << 12)
+#define B2L_FORMAT_RGBA16_FLOAT (223u << 12)
+#define B2L_FORMAT_R8_UNORM     (163u << 12)
 #define B2L_FORMAT_RG32F        ((175u << 12) | 16u)
 #define B2L_FORMAT_RGBA8_TB     (237u << 12)
 #define B2L_WRAP_CLAMP_EDGE     9u
@@ -65,6 +68,7 @@ struct b2l_mali_quad {
 	uint32_t fau_slots;             /* 64-bit push uniform slots the shader reads */
 	uint32_t first_clause_blends;   /* the shader is only the BLEND clause */
 	uint32_t linear;                /* filter texels, for scaled layers */
+	uint32_t texture_mask;          /* one channel, read into all four */
 };
 
 struct b2l_mali_target {
@@ -150,7 +154,7 @@ b2l_mali_write_texture(uint8_t *f, uint64_t va, const struct b2l_mali_quad *q)
 
 	t[0] = 2u | (2u << 4) | (q->texture_format << 10);
 	t[1] = (q->texture_width - 1) | ((q->texture_height - 1) << 16);
-	t[2] = 0x688u | (2u << 12);                     /* identity, linear */
+	t[2] = (q->texture_mask ? 0u : 0x688u) | (2u << 12);    /* RRRR or identity, linear */
 	b2l_put64(t + 4, va + B2L_D_SURFACE);
 	b2l_put64(surface, q->texture_va);
 	surface[2] = q->texture_stride;

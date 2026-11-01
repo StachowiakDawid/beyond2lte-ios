@@ -73,7 +73,7 @@ assert (quads[2][0] >> 6) & 3 == 1, 'clause ends on its third quadword'
 
 # Every quadword reaches the header exactly as the encoder generated it.
 text = (ROOT / 'xnu-overlay/iokit/Kernel/arm/b2l_mali_shaders.h').read_text()
-assert len(re.findall(r'0x[0-9a-f]{16}ull', text)) == 2 * (len(gen.solid()) + len(gen.textured()) + len(gen.modulated()))
+assert len(re.findall(r'0x[0-9a-f]{16}ull', text)) == 2 * (len(gen.tinted()) + len(gen.solid()) + len(gen.textured()) + len(gen.modulated()))
 
 TEST = r'''
 #include <assert.h>
@@ -85,7 +85,7 @@ int main(void) {
  const uint64_t va = 0x1000000;
  struct b2l_mali_target rt = { 0x2000000, 1440, 2904, 5760, 0xff2040c0, B2L_RT_BGRA, 0x3000000, 1u << 24 };
  struct b2l_mali_quad q = { 1, 2, 3, 4, 0, 0, 1, 1, { 1, 0, 0, 1 }, 0x4000000, 0x5000000,
-  256, 128, 1024, B2L_FORMAT_BGRA8_UNORM, B2L_EQ_SRC_OVER, 0, 1, 0 };
+  256, 128, 1024, B2L_FORMAT_BGRA8_UNORM, B2L_EQ_SRC_OVER, 0, 1, 0, 0 };
  struct b2l_mali_pass pass;
  memset(frame, 0xa5, sizeof frame);
  b2l_mali_pass_begin(&pass, frame, va, &rt);

@@ -24,4 +24,11 @@ static const uint64_t b2l_mali_shader_modulated[] = {
 	0x80cb1843c000084eull, 0x024000040002a583ull,
 };
 
+static const uint64_t b2l_mali_shader_tinted[] = {
+	0x0007004800c38029ull, 0x4806000cc0076590ull,
+	0x0007400810008021ull, 0x380041020c0f6590ull,
+	0x0007400830828145ull, 0x2401d96400076590ull,
+	0x80cb1843c000084eull, 0x024000040002a583ull,
+};
+
 #endif /* _B2L_MALI_SHADERS_H */

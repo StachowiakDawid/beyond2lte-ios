@@ -362,6 +362,7 @@ static uint32_t expect_linear(uint32_t x, uint32_t y)
 	uint32_t v = (2 * x + 1) * 255 / 512;
 	return 0xff000000u | v | (v << 8) | (v << 16);
 }
+static uint32_t expect_tint(uint32_t x, uint32_t y) { (void)x; (void)y; return 0x80802040u; }
 static uint32_t expect_over(uint32_t x, uint32_t y) { (void)x; (void)y; return 0xff5060a0u; }
 
 static void
@@ -410,7 +411,7 @@ draw_tests(void)
 	c.target = (struct b2l_mali_target){ (uint64_t)c.rt, width, height, stride, CLEAR_COLOUR,
 		B2L_RT_RGBA, (uint64_t)c.heap, heap_bytes };
 
-	uint64_t *solid = (uint64_t *)c.code, *textured = solid + 64, *modulated = solid + 128;
+	uint64_t *solid = (uint64_t *)c.code, *textured = solid + 64, *modulated = solid + 128, *tinted = solid + 192;
 	for (size_t i = 0; i < sizeof(b2l_mali_shader_solid) / 8; i++) {
 		solid[i] = b2l_mali_shader_solid[i];
 	}
@@ -420,6 +421,10 @@ draw_tests(void)
 
 	for (size_t i = 0; i < sizeof(b2l_mali_shader_modulated) / 8; i++) {
 		modulated[i] = b2l_mali_shader_modulated[i];
+	}
+
+	for (size_t i = 0; i < sizeof(b2l_mali_shader_tinted) / 8; i++) {
+		tinted[i] = b2l_mali_shader_tinted[i];
 	}
 
 	struct b2l_mali_quad q = {
@@ -455,6 +460,28 @@ draw_tests(void)
 		return 1;
 	}
 	failed |= check_rect(&c, "src_over", 100, 200, 356, 456, expect_over, 2, ns);
+
+	/* A one-byte mask times a full colour, the way text is drawn. */
+	uint8_t *mask = (uint8_t *)c.texture;
+	for (uint32_t i = 0; i < 256 * 256; i++) {
+		mask[i] = 128;
+	}
+	struct b2l_mali_quad tint = q;
+	tint.colour[0] = F(0.5f);
+	tint.colour[1] = F(0.25f);
+	tint.colour[2] = F(1);
+	tint.colour[3] = F(1);
+	tint.shader_va = (uint64_t)tinted;
+	tint.texture_stride = 256;
+	tint.texture_format = B2L_FORMAT_R8_UNORM;
+	tint.equation = B2L_EQ_COPY;
+	tint.fau_slots = 2;
+	tint.first_clause_blends = 0;
+	tint.texture_mask = 1;
+	if (draw_quad(&c, &tint, "tinted", &ns)) {
+		return 1;
+	}
+	failed |= check_rect(&c, "tinted", 100, 200, 356, 456, expect_tint, 2, ns);
 
 	/* One full-screen translucent layer, the UI's common case. */
 	for (size_t i = 0; i < surface / 4; i++) {

@@ -86,6 +86,9 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #define BLEND_COPY  1
 #define BLEND_SOVER 3
 #define BLEND_ADD 12
+#define IMAGE_FORMAT_MASK 9
+#define IMAGE_FORMAT_RGBA8 11
+#define IMAGE_FORMAT_RGBA16F 13
 #define IMAGE_IDENTITY 0
 #define UNIT_SURFACE 3
 #define VERTEX_WORDS 12         /* position vec4, texture vec4, RGBA half floats */
@@ -98,8 +101,8 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #define SHADOW_MAX_W 1440
 #define SHADOW_MAX_H 3040
 #define SHADOW_BYTES ((uint64_t)SHADOW_MAX_W * 4 * SHADOW_MAX_H)
-#define STAGE_BYTES (8ull * 1024 * 1024) /* images whose rows the GPU cannot read in place */
-#define MAX_QUADS 16
+#define STAGE_BYTES (16ull * 1024 * 1024) /* images whose rows the GPU cannot read in place */
+#define MAX_QUADS 48
 #define PASS_DRAWS (MAX_QUADS + 1)
 #define TOLERANCE 2
 
@@ -158,6 +161,7 @@ static uint32_t pass_type, heap_bytes;
 #define SHADER_TEXTURED  0x000
 #define SHADER_SOLID     0x100
 #define SHADER_MODULATED 0x200
+#define SHADER_TINTED    0x300
 
 static uint64_t
 to_us(uint64_t ticks)
@@ -317,6 +321,8 @@ struct translation {
 	const uint8_t *texture;
 	size_t texture_bytes, texture_source_stride;
 	int staged;                     /* sampled through stage_cpu, whose rows are aligned */
+	unsigned texel_bytes;
+	int tinted;                     /* a colour, or a one-channel mask: not proven live yet */
 	float opacity;
 };
 
@@ -326,6 +332,7 @@ struct source {
 	uint64_t magnitude;
 	int64_t stride;
 	int width, height, linear, staged;
+	unsigned texel_bytes;
 	float opacity;
 };
 
@@ -511,10 +518,11 @@ translate(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 			src.linear = (FIELD(unit, 0x34, uint64_t) & 0xff0000) != 0;
 		}
 		src.magnitude = src.stride < 0 ? (uint64_t)-src.stride : (uint64_t)src.stride;
+		src.texel_bytes = key->format == IMAGE_FORMAT_RGBA16F ? 8 : key->format == IMAGE_FORMAT_MASK ? 1 : 4;
 		if (data == NULL || src.width <= 0 || src.height <= 0 || src.width > 16384 || src.height > 16384) {
 			return R_TEXTURE;
 		}
-		if ((src.magnitude & 63) || src.magnitude < (uint64_t)src.width * 4) {
+		if ((src.magnitude & 63) || src.magnitude < (uint64_t)src.width * src.texel_bytes) {
 			static uint32_t formats_seen;
 			reject_samples[R_TEXTURE_STRIDE]++;
 			if (key->format < 32 && !(formats_seen & (1u << key->format))) {
@@ -522,8 +530,8 @@ translate(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 				log_line("S kind=%u fmt=%u %dx%d stride=%llu", key->kind, key->format, src.width, src.height,
 				    src.magnitude);
 			}
-			src.staged = src.magnitude >= (uint64_t)src.width * 4 &&
-			    (((uint64_t)src.width * 4 + 63) & ~63ull) * (uint64_t)src.height <= STAGE_BYTES;
+			uint64_t row = (uint64_t)src.width * src.texel_bytes;
+			src.staged = src.magnitude >= row && ((row + 63) & ~63ull) * (uint64_t)src.height <= STAGE_BYTES;
 			if (!src.staged) {
 				return R_TEXTURE_STRIDE;
 			}
@@ -575,20 +583,29 @@ translate(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 		if (key->kind == 1) {
 			r = green = b = a = 1.0f;
 		}
-		if (r != green || green != b || b != a) {
-			return R_TINT;  /* a tint, not an opacity */
-		}
+		int tinted = r != green || green != b || b != a;
 		t->texture = src.stride < 0 ? data + (int64_t)(src.height - 1) * src.stride : data;
 		t->texture_bytes = (size_t)src.magnitude * (size_t)src.height;
 		t->texture_source_stride = (size_t)src.magnitude;
 		t->staged = src.staged;
 		common.texture_width = (uint32_t)src.width;
 		common.texture_height = (uint32_t)src.height;
-		common.texture_stride = src.staged ? (uint32_t)(((uint64_t)src.width * 4 + 63) & ~63ull) : (uint32_t)src.magnitude;
-		common.texture_format = B2L_FORMAT_BGRA8_UNORM;
+		common.texture_stride = src.staged ? (uint32_t)(((uint64_t)src.width * src.texel_bytes + 63) & ~63ull) :
+		    (uint32_t)src.magnitude;
+		common.texture_format = key->format == IMAGE_FORMAT_RGBA16F ? B2L_FORMAT_RGBA16_FLOAT :
+		    key->format == IMAGE_FORMAT_RGBA8 ? B2L_FORMAT_RGBA8_UNORM :
+		    key->format == IMAGE_FORMAT_MASK ? B2L_FORMAT_R8_UNORM : B2L_FORMAT_BGRA8_UNORM;
+		common.texture_mask = key->format == IMAGE_FORMAT_MASK;
+		t->texel_bytes = src.texel_bytes;
 		common.linear = (uint32_t)src.linear;
 		t->opacity = a;
-		if (a == 1.0f) {
+		t->tinted = tinted || common.texture_mask;
+		if (tinted) {
+			float value[4] = { r, green, b, a };
+			memcpy(common.colour, value, sizeof(value));
+			common.shader_va = code_va + SHADER_TINTED;
+			common.fau_slots = 2;
+		} else if (a == 1.0f) {
 			common.shader_va = code_va + SHADER_TEXTURED;
 			common.first_clause_blends = 1;
 		} else {
@@ -662,13 +679,14 @@ gpu_draw(struct translation *t, int live)
 		const uint8_t *sampled_base = t->staged ? stage_cpu : t->texture;
 		if (t->staged) {
 			for (uint32_t y = ty0; y < ty1; y++) {
-				memcpy(stage_cpu + y * stride + (size_t)tx0 * 4, t->texture + y * t->texture_source_stride + (size_t)tx0 * 4,
-				    (size_t)(tx1 - tx0) * 4);
+				memcpy(stage_cpu + y * stride + (size_t)tx0 * t->texel_bytes,
+				    t->texture + y * t->texture_source_stride + (size_t)tx0 * t->texel_bytes,
+				    (size_t)(tx1 - tx0) * t->texel_bytes);
 			}
 		}
 		if (tx1 > tx0 && ty1 > ty0) {
-			struct flush_rect sampled = { sampled_base + ty0 * stride + (size_t)tx0 * 4, stride,
-				(size_t)(tx1 - tx0) * 4, ty1 - ty0 };
+			struct flush_rect sampled = { sampled_base + ty0 * stride + (size_t)tx0 * t->texel_bytes, stride,
+				(size_t)(tx1 - tx0) * t->texel_bytes, ty1 - ty0 };
 			cache_flush(&sampled);
 		}
 		uint64_t texture_va = t->staged ? stage_va : map_range(t->texture, t->texture_bytes);
@@ -690,7 +708,7 @@ gpu_draw(struct translation *t, int live)
 	struct b2l_mali_quad keep = {
 		b2l_int_float((uint32_t)bx0), b2l_int_float((uint32_t)by0), b2l_int_float((uint32_t)bx1),
 		b2l_int_float((uint32_t)by1), 0, 0, 0, 0, { 0, 0, 0, 0 }, code_va + SHADER_TEXTURED, target_va,
-		t->width, t->height, t->stride, B2L_FORMAT_BGRA8_UNORM, B2L_EQ_COPY, 0, 1, 0,
+		t->width, t->height, t->stride, B2L_FORMAT_BGRA8_UNORM, B2L_EQ_COPY, 0, 1, 0, 0,
 	};
 	memcpy(&keep.u0, &u0, 4);
 	memcpy(&keep.u1, &u1, 4);
@@ -738,8 +756,10 @@ gpu_draw(struct translation *t, int live)
 static int
 live_kind(const struct draw_key *key)
 {
-	/* Image format 1: 23 of 23 exact in 0140, 8 of 8 in 0139. */
-	int source = key->unit0 == UNIT_SURFACE || ((key->unit0 == 1 || key->unit0 == 2) && key->format == 1);
+	/* Image formats 1, 11 and 13: no wrong pixels in 0143, 183 draws compared. */
+	int image = (key->unit0 == 1 || key->unit0 == 2) && (key->format == 1 || key->format == IMAGE_FORMAT_RGBA8 ||
+	    key->format == IMAGE_FORMAT_RGBA16F);
+	int source = key->unit0 == UNIT_SURFACE || image;
 	if (!source || key->unit1 != 0 || key->image != IMAGE_IDENTITY) {
 		return 0;
 	}
@@ -832,7 +852,7 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 
 	/* Render threads share the pass and shadow buffers: one at a time. */
 	int want_shadow = stat != NULL && compared_in_window < SHADOW_PER_WINDOW && stat->compared < SHADOW_PER_KEY;
-	int may_go_live = stat != NULL && live_kind(&key) && stat->compared >= LIVE_SAMPLES;
+	int may_go_live = stat != NULL && live_kind(&key) && stat->compared >= LIVE_SAMPLES && stat->wrong == 0;
 	if (shadow_ready && !shadow_disabled && (want_shadow || may_go_live) &&
 	    !__atomic_exchange_n(&shadow_busy, 1, __ATOMIC_ACQUIRE)) {
 		owner = 1;
@@ -840,7 +860,7 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 		if (why != R_NONE) {
 			rejects[why]++;
 			stat->why = why;
-		} else if (may_go_live && !t.staged && (t.x1 - t.x0) * (t.y1 - t.y0) >= LIVE_MIN_PIXELS && live_worthwhile(&key, &t)) {
+		} else if (may_go_live && !t.tinted && (t.x1 - t.x0) * (t.y1 - t.y0) >= LIVE_MIN_PIXELS && live_worthwhile(&key, &t)) {
 			uint64_t ticks = gpu_draw(&t, 1);
 			if (ticks) {
 				/* What the CPU path does after drawing. */
@@ -974,6 +994,7 @@ prepare_shadow(void)
 	memcpy(code + SHADER_TEXTURED, b2l_mali_shader_textured, sizeof(b2l_mali_shader_textured));
 	memcpy(code + SHADER_SOLID, b2l_mali_shader_solid, sizeof(b2l_mali_shader_solid));
 	memcpy(code + SHADER_MODULATED, b2l_mali_shader_modulated, sizeof(b2l_mali_shader_modulated));
+	memcpy(code + SHADER_TINTED, b2l_mali_shader_tinted, sizeof(b2l_mali_shader_tinted));
 	struct flush_rect page = { code, 4096, 4096, 1 };
 	cache_flush(&page);
 	return 1;

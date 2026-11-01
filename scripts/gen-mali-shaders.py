@@ -23,7 +23,7 @@ ADD_NOP = 0x3D964
 ADD_MOV = 0x3D968
 ADD_BLEND = 0xCA800
 
-PORT0, FAU_LO, FAU_HI = 0, 4, 5
+PORT0, ZERO_FMA, FAU_LO, FAU_HI = 0, 3, 4, 5
 FAU_BLEND0 = 0x08
 FAU_UNIFORM = 0x80
 COVERAGE_REG = 60               # preloaded by the "coverage" RSD bit
@@ -142,7 +142,23 @@ def modulated():
     return clause_4(h, t0, t1, t2, t3) + blend_clause()
 
 
-SHADERS = {'solid': solid, 'textured': textured, 'modulated': modulated}
+def tinted():
+    """r0..r3 from the texture, each times its own push uniform, then blend.
+
+    Like modulated, but all four words of the two uniform slots are factors, so
+    the addend is FMA's constant zero.
+    """
+    def multiply(half):
+        return FMA_F32 | PORT0 | half << 3 | ZERO_FMA << 6
+    t0 = tuple78(registers(MODE_I_W_FMA, first=True, fau=FAU_UNIFORM | 0, read=0, slot2=3, slot3=3), multiply(FAU_LO))
+    t1 = tuple78(registers(MODE_I_W_FMA, fau=FAU_UNIFORM | 0, read=1, slot2=0, slot3=0), multiply(FAU_HI))
+    t2 = tuple78(registers(MODE_I_W_FMA, fau=FAU_UNIFORM | 1, read=2, slot2=1, slot3=1), multiply(FAU_LO))
+    t3 = tuple78(registers(MODE_I_W_FMA, fau=FAU_UNIFORM | 1, read=3, slot2=2, slot3=2), multiply(FAU_HI))
+    h = header(FLOW_NBTB, next_message=MESSAGE_BLEND, wait=WAIT_TILEBUFFER, prefetch=True)
+    return clause_4(h, t0, t1, t2, t3) + blend_clause()
+
+
+SHADERS = {'solid': solid, 'textured': textured, 'modulated': modulated, 'tinted': tinted}
 
 
 def render():
